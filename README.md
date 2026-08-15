@@ -120,3 +120,7 @@ See [LICENSE](LICENSE) for the short form.
 ## Roadmap
 
 High-level plan and phase status: [ROADMAP.md](ROADMAP.md).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for clean-room rules and PR expectations.
