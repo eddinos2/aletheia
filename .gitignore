@@ -12,3 +12,7 @@ PLAN_*.md
 dump_*.txt
 *.pdb
 .redump/
+
+# Large locally-built adversarial binaries (sources + version_pair stay tracked).
+fixtures/adversarial/go_stripped/hello
+fixtures/adversarial/rust_panic/hello

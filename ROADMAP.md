@@ -54,8 +54,8 @@ and Apple/iOS support over time.
 
 | Track | Landed | Next |
 |---|---|---|
-| **Engine** | irstack, sig, MEM promote, irtype, **typebounds E3**, FLIRT sample, **api 1.0** | FLIRT corpus growth |
-| **iOS / Apple** | chained walk, ObjC + selrefs, Swift types/fields/**conformances** | witness table slot depth |
+| **Engine** | irstack, sig, MEM promote, irtype, typebounds E3, **FLIRT corpus F1**, api 1.0 | corpus CRC growth from real libs |
+| **iOS / Apple** | chained, ObjC, Swift types/fields/conformances/**witnesses** | ObjC category depth |
 | **Patch / Diff** | PatchSet, patch-from-diff, A64 assemble | codesign recipe depth |
 | **Agents / UI** | MCP, `--json`, GUI G1, bench smoke, **api 1.0** | finer delta ids; notarized DMG |
 

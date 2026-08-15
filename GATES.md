@@ -52,6 +52,13 @@ graph is cheap; typed prototypes via `irtype` + `types::ParamTypeMap::render_pro
       `why` tools (progress/cancel stubs)
 - [x] Agent can decompile without GUI (manual smoke via stdio JSON)
 
+## Gate F1 — FLIRT / adversarial pack
+
+- [x] Expanded open corpus at `testdata/flirt/sample.corpus`
+- [x] `--flirt` defaults to that corpus when present
+- [x] `scripts/gen-adversarial-fixtures.sh` + `fixtures/adversarial/version_pair`
+- [x] Scorecard template remains [docs/SCORECARD.md](docs/SCORECARD.md)
+
 ## Gate S1 — Scripting / plugin ABI
 
 - [x] Versioned `aletheia::api` (`API_VERSION` 1.0.0) with `AnalysisSession`

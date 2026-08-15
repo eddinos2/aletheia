@@ -47,10 +47,13 @@ blind full `functions` reload:
   "delta": {
     "kind": "annotate",
     "functions": [{ "va": "0x…", "name": "…", "source": "asserted" }],
+    "facts": [
+      { "id": "annotate:name:0x…", "kind": "name", "va": "0x…", "name": "…", "seq": 1 }
+    ],
     "invalidate": [
-      { "view": "listing", "va": "0x…" },
-      { "view": "why", "va": "0x…" },
-      { "view": "decompile", "va": "0x…" }
+      { "view": "listing", "va": "0x…", "fact_id": "annotate:name:0x…" },
+      { "view": "why", "va": "0x…", "fact_id": "annotate:name:0x…" },
+      { "view": "decompile", "va": "0x…", "fact_id": "annotate:name:0x…" }
     ]
   },
   "stamp": { "hash": "0x…", "engine_version": "…" }
@@ -66,8 +69,13 @@ Client policy:
    every rename.
 
 `invalidate` is advisory. Unknown `view` strings are ignored. Granularity
-today is per-function VA; finer per-fact ids can land later without
-breaking this shape.
+today is per-function VA; optional `facts[]` / `invalidate[].fact_id`
+narrow a soft-refetch to one stable assertion slot when present.
+
+**Fact ids (optional, additive):** `delta.facts` lists asserted facts with
+a stable `id` (rename uses `annotate:name:0x{va}`; future annotate kinds
+may use seq-based ids from the annotate log). `invalidate` entries may
+echo `fact_id` when known. Older clients ignore unknown fields.
 
 ## Navigation helpers
 

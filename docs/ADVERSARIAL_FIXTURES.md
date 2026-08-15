@@ -10,7 +10,15 @@ trademark parody.
 |---|---|
 | `fixtures/diamond` | CFG diamond / if-else structuring |
 | `fixtures/loop_bc` | Loop back-edge |
+| `fixtures/adversarial/version_pair/` | Tiny C old/new for `--diff` / patch |
+| `testdata/flirt/sample.corpus` | Default open FLIRT patterns (`--flirt`) |
 | Other `fixtures/*` | Decoder / IR edge cases |
+
+Refresh adversarial binaries:
+
+```console
+./scripts/gen-adversarial-fixtures.sh
+```
 
 ## Headless smoke
 

@@ -476,6 +476,9 @@ fn rename_method(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
             .ok_or_else(|| format!("no function at {va:#x}"))?;
         let target = anchor::of_function(image.as_ref(), func);
         sess.db.set_name(target, &name);
+        // Stable slot id for the name fact at this VA (survives rename
+        // revisions). Content fingerprint lives on tip.id / annotate log.
+        let fact_id = format!("annotate:name:0x{va:x}");
         let tip = sess
             .db
             .log()
@@ -489,14 +492,16 @@ fn rename_method(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
                 )
             })
             .unwrap_or_else(|| "null".into());
+        let seq = sess.db.log().last().map(|a| a.seq).unwrap_or(0);
         let hash = sess.hash;
-        // Incremental delta: patch one navigator row; soft-invalidate
-        // views that embed the name (listing / why). Decompile text does
-        // not currently fold annotate names — still listed so clients can
-        // choose a clean refetch policy without guessing.
+        // Incremental delta: patch one navigator row; emit facts[]; soft-
+        // invalidate views that embed the name (listing / why). Decompile
+        // text does not currently fold annotate names — still listed so
+        // clients can choose a clean refetch policy without guessing.
+        // Unknown fields (facts, fact_id) are ignored by older clients.
+        let n = escape_json(&name);
         let delta = format!(
-            r#"{{"kind":"annotate","functions":[{{"va":"0x{va:x}","name":"{n}","source":"asserted"}}],"invalidate":[{{"view":"listing","va":"0x{va:x}"}},{{"view":"why","va":"0x{va:x}"}},{{"view":"decompile","va":"0x{va:x}"}}]}}"#,
-            n = escape_json(&name),
+            r#"{{"kind":"annotate","functions":[{{"va":"0x{va:x}","name":"{n}","source":"asserted"}}],"facts":[{{"id":"{fact_id}","kind":"name","va":"0x{va:x}","name":"{n}","seq":{seq}}}],"invalidate":[{{"view":"listing","va":"0x{va:x}","fact_id":"{fact_id}"}},{{"view":"why","va":"0x{va:x}","fact_id":"{fact_id}"}},{{"view":"decompile","va":"0x{va:x}","fact_id":"{fact_id}"}}]}}"#
         );
         Ok::<_, String>((tip, delta, hash))
     })();
@@ -1157,6 +1162,17 @@ mod tests {
         assert!(reply.contains(r#""source":"asserted""#), "{reply}");
         assert!(reply.contains(r#""invalidate""#), "{reply}");
         assert!(reply.contains("g1_renamed"), "{reply}");
+        // Stable fact id + invalidate linkage (additive; old clients ignore).
+        let fact_id = "annotate:name:0x1000003d0";
+        assert!(
+            reply.contains(&format!(r#""facts":[{{"id":"{fact_id}""#)),
+            "{reply}"
+        );
+        assert!(reply.contains(r#""kind":"name""#), "{reply}");
+        assert!(
+            reply.contains(&format!(r#""fact_id":"{fact_id}""#)),
+            "{reply}"
+        );
 
         // functions refetch must surface asserted name without inventing facts
         let funcs = handle_line(

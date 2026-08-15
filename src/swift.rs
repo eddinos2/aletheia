@@ -17,7 +17,10 @@
 //! 4. Walks `__swift5_proto` relative pointers to
 //!    `ProtocolConformanceDescriptor`s, recovering protocol / type
 //!    names and `ConformanceFlags` when safely readable.
-//! 5. Optionally samples printable C-strings from `__swift5_reflstr`
+//! 5. Follows each conformance's `WitnessTablePattern` relative pointer
+//!    to a protocol witness table, recovering capped requirement-slot
+//!    VAs (and optional symbol / nearby-string names).
+//! 6. Optionally samples printable C-strings from `__swift5_reflstr`
 //!    and mangled-looking UTF-8 runs from `__swift5_typeref`.
 //!
 //! Full Swift demangling (`$s…` → readable signatures) is deliberately
@@ -62,6 +65,9 @@ pub const MAX_SECTIONS: usize = 256;
 /// Cap on protocol conformance descriptors from `__swift5_proto`.
 pub const MAX_PROTO_CONFORMANCES: usize = 65_536;
 
+/// Cap on witness-table requirement slots recovered per conformance.
+pub const MAX_WITNESSES_PER_CONFORMANCE: usize = 4096;
+
 /// Cap on parent-descriptor walks when resolving a module prefix.
 const MAX_PARENT_DEPTH: usize = 8;
 
@@ -72,6 +78,20 @@ const TYPE_DESC_MIN: u64 = 20;
 /// Public ABI `ProtocolConformanceDescriptor` size:
 /// `Protocol` + `TypeRef` + `WitnessTablePattern` + `ConformanceFlags`.
 const CONFORMANCE_DESC_SIZE: u64 = 16;
+
+/// Protocol descriptor bytes needed for `NumRequirements`:
+/// `Flags` + `Parent` + `Name` + `NumRequirementsInSignature` + `NumRequirements`.
+const PROTOCOL_NUM_REQ_MIN: u64 = 20;
+
+/// Public ABI: first requirement slot is at pointer index 1
+/// (`WitnessTableFirstRequirementOffset` in `MetadataValues.h`).
+const WITNESS_TABLE_FIRST_REQ: u64 = 1;
+
+/// Bytes before a witness VA scanned for a nearby printable C-string name.
+const WITNESS_NAME_NEARBY: u64 = 64;
+
+/// Cap on a recovered witness entry name.
+const MAX_WITNESS_NAME_LEN: usize = 256;
 
 /// Minimum readable size of a protocol / type context descriptor name:
 /// `Flags` + `Parent` + `Name`.
@@ -232,11 +252,20 @@ pub struct SwiftType {
     pub fields: Vec<SwiftField>,
 }
 
+/// One recovered protocol witness-table requirement slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwiftWitness {
+    /// Virtual address of the witness (method impl / associated metadata).
+    pub va: u64,
+    /// Symbol or nearby C-string name when resolvable; `None` is VA-only.
+    pub name: Option<String>,
+}
+
 /// One recovered protocol conformance from `__swift5_proto`.
 ///
 /// Layout follows the public `ProtocolConformanceDescriptor`: protocol
 /// relative pointer, type/context relative pointer, witness-table
-/// pattern (not recovered here), and `ConformanceFlags`.
+/// pattern (followed when readable), and `ConformanceFlags`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwiftConformance {
     /// Virtual address of the conformance descriptor.
@@ -249,6 +278,10 @@ pub struct SwiftConformance {
     pub type_name: Option<String>,
     /// Raw `ConformanceFlags` word (`0` when the flags field was unreadable).
     pub flags: u32,
+    /// Requirement slots from `WitnessTablePattern` when the relative
+    /// pointer is a readable witness table (capped at
+    /// [`MAX_WITNESSES_PER_CONFORMANCE`]). Soft-fails to empty / VA-only.
+    pub witnesses: Vec<SwiftWitness>,
 }
 
 /// Recovered Swift metadata for one thin Mach-O image.
@@ -481,6 +514,16 @@ pub fn render(image: &SwiftImage, max_types: usize) -> String {
                 "    {ty} : {proto}  // va {:#x}  flags {:#x}",
                 conf.va, conf.flags
             );
+            for w in &conf.witnesses {
+                match &w.name {
+                    Some(name) if !name.is_empty() => {
+                        let _ = writeln!(out, "      witness {:#x}  {name}", w.va);
+                    }
+                    _ => {
+                        let _ = writeln!(out, "      witness {:#x}", w.va);
+                    }
+                }
+            }
         }
         if image.proto_conformances.len() > 32 {
             let _ = writeln!(
@@ -706,19 +749,21 @@ fn parse_proto_section(
 /// Parse a public ABI `ProtocolConformanceDescriptor` at `desc_va`.
 ///
 /// Always returns a record for a file-backed VA; unreadable fields soft-fail
-/// to `None` / `flags = 0` rather than aborting recovery.
+/// to `None` / `flags = 0` / empty witnesses rather than aborting recovery.
 fn parse_conformance_descriptor(
     mach: &MachFile,
     data: &[u8],
     desc_va: u64,
 ) -> SwiftConformance {
+    let empty = || SwiftConformance {
+        va: desc_va,
+        protocol_name: None,
+        type_name: None,
+        flags: 0,
+        witnesses: Vec::new(),
+    };
     let Some(_) = bytes_at(mach, data, desc_va, CONFORMANCE_DESC_SIZE as usize) else {
-        return SwiftConformance {
-            va: desc_va,
-            protocol_name: None,
-            type_name: None,
-            flags: 0,
-        };
+        return empty();
     };
     let flags = read_u32(mach, data, desc_va + 12).unwrap_or(0);
     let protocol_name = read_i32(mach, data, desc_va)
@@ -726,12 +771,171 @@ fn parse_conformance_descriptor(
     let type_name = read_i32(mach, data, desc_va + 4).and_then(|rel| {
         resolve_conformance_type_name(mach, data, desc_va + 4, rel, flags)
     });
+    let witnesses = read_i32(mach, data, desc_va + 8)
+        .map(|rel| recover_witnesses(mach, data, desc_va, rel))
+        .unwrap_or_default();
     SwiftConformance {
         va: desc_va,
         protocol_name,
         type_name,
         flags,
+        witnesses,
     }
+}
+
+/// Follow `WitnessTablePattern` and recover capped requirement-slot entries.
+///
+/// Soft-fails to an empty list on null / unreadable pattern pointers.
+fn recover_witnesses(
+    mach: &MachFile,
+    data: &[u8],
+    conf_va: u64,
+    pattern_rel: i32,
+) -> Vec<SwiftWitness> {
+    if pattern_rel == 0 {
+        return Vec::new();
+    }
+    let Some(table_va) = relative_va(conf_va + 8, pattern_rel) else {
+        return Vec::new();
+    };
+    // Description word must be file-backed before walking slots.
+    if bytes_at(mach, data, table_va, 8).is_none() {
+        return Vec::new();
+    }
+    let num_req = protocol_num_requirements_for_conformance(mach, data, conf_va);
+    parse_witness_table_slots(mach, data, table_va, num_req)
+}
+
+/// Read `NumRequirements` from the protocol descriptor linked by `conf_va`.
+fn protocol_num_requirements_for_conformance(
+    mach: &MachFile,
+    data: &[u8],
+    conf_va: u64,
+) -> Option<usize> {
+    let rel = read_i32(mach, data, conf_va)?;
+    if rel == 0 || rel & REL_PROTOCOL_IS_OBJC_BIT != 0 {
+        return None;
+    }
+    let proto_va = resolve_relative_indirectable(mach, data, conf_va, rel)?;
+    read_protocol_num_requirements(mach, data, proto_va)
+}
+
+fn read_protocol_num_requirements(
+    mach: &MachFile,
+    data: &[u8],
+    proto_va: u64,
+) -> Option<usize> {
+    let _ = bytes_at(mach, data, proto_va, PROTOCOL_NUM_REQ_MIN as usize)?;
+    let flags = read_u32(mach, data, proto_va)?;
+    if flags & KIND_MASK != KIND_PROTOCOL {
+        return None;
+    }
+    let n = read_u32(mach, data, proto_va + 16)? as usize;
+    Some(n.min(MAX_WITNESSES_PER_CONFORMANCE))
+}
+
+/// Walk witness-table pointer slots starting at
+/// [`WITNESS_TABLE_FIRST_REQ`] (skipping the Description word).
+///
+/// When `num_req` is known, that many slots are examined (null / unmapped
+/// skipped). When unknown, walk until a null or unmapped pointer, capped.
+fn parse_witness_table_slots(
+    mach: &MachFile,
+    data: &[u8],
+    table_va: u64,
+    num_req: Option<usize>,
+) -> Vec<SwiftWitness> {
+    let known = num_req.is_some();
+    let limit = num_req
+        .unwrap_or(MAX_WITNESSES_PER_CONFORMANCE)
+        .min(MAX_WITNESSES_PER_CONFORMANCE);
+    let mut out = Vec::new();
+    for i in 0..limit {
+        let Some(slot_va) = table_va
+            .checked_add(WITNESS_TABLE_FIRST_REQ.saturating_mul(8))
+            .and_then(|base| base.checked_add((i as u64).saturating_mul(8)))
+        else {
+            break;
+        };
+        let Some(entry_va) = read_ptr(mach, data, slot_va) else {
+            if known {
+                continue;
+            }
+            break;
+        };
+        if entry_va == 0 {
+            if known {
+                continue;
+            }
+            break;
+        }
+        if mach.vaddr_to_offset(entry_va).is_err() {
+            if known {
+                continue;
+            }
+            break;
+        }
+        let name = name_for_witness_va(mach, data, entry_va);
+        out.push(SwiftWitness {
+            va: entry_va,
+            name,
+        });
+    }
+    out
+}
+
+/// Resolve an optional name for a witness VA via the Mach-O symbol table
+/// or a nearby / at-VA printable C-string. Soft-fails to `None`.
+fn name_for_witness_va(mach: &MachFile, data: &[u8], va: u64) -> Option<String> {
+    for sym in &mach.symbols {
+        if sym.value == va && !sym.name.is_empty() && looks_like_witness_name(&sym.name) {
+            return Some(sym.name.clone());
+        }
+    }
+    if let Some(s) = read_cstr_capped(mach, data, va, MAX_WITNESS_NAME_LEN)
+        && looks_like_witness_name(&s)
+    {
+        return Some(s);
+    }
+    name_nearby_cstr(mach, data, va)
+}
+
+/// Scan for a printable C-string that ends immediately before `va`
+/// (`…name\\0<code>` stub labeling). Soft-fails when absent.
+fn name_nearby_cstr(mach: &MachFile, data: &[u8], va: u64) -> Option<String> {
+    let off = mach.vaddr_to_offset(va).ok()?;
+    if off == 0 || data.get(off - 1) != Some(&0) {
+        return None;
+    }
+    let end = off - 1; // index of terminating NUL
+    let start_floor = off.saturating_sub(WITNESS_NAME_NEARBY as usize);
+    let mut s = end;
+    while s > start_floor && data[s - 1] != 0 {
+        s -= 1;
+    }
+    let slice = data.get(s..end)?;
+    if slice.is_empty() || slice.len() > MAX_WITNESS_NAME_LEN {
+        return None;
+    }
+    if !slice.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+        return None;
+    }
+    let name = String::from_utf8_lossy(slice).into_owned();
+    if looks_like_witness_name(&name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn looks_like_witness_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() > MAX_WITNESS_NAME_LEN {
+        return false;
+    }
+    b.iter().all(|&c| (0x20..=0x7E).contains(&c))
+        && b.iter()
+            .any(|&c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
 /// Resolve the protocol relative field (relative-indirectable; bit 1 = ObjC).
@@ -1127,6 +1331,9 @@ mod tests {
     const PROTO_DESC_OFF: usize = 0x388; // protocol descriptor
     const CONF_DESC_OFF: usize = 0x3A0; // ProtocolConformanceDescriptor
     const PROTOSECT_OFF: usize = 0x3B0; // __swift5_proto (one rel32)
+    const WITNESS_TBL_OFF: usize = 0x3C0; // witness table (Description + 2 slots)
+    const W0_NAME_OFF: usize = 0x3D8; // "doNamed\0" (name at witness VA)
+    const W1_OFF: usize = 0x3E8; // anonymous witness payload (no name)
 
     /// Public ABI `FieldDescriptorKind::Struct`.
     const FIELD_KIND_STRUCT: u16 = 0;
@@ -1363,11 +1570,23 @@ mod tests {
             rel32(proto_va + 8, TEXT_VM + PROTO_NAME_OFF as u64),
         );
         put32(&mut img, PROTO_DESC_OFF + 12, 0); // NumRequirementsInSignature
-        put32(&mut img, PROTO_DESC_OFF + 16, 0); // NumRequirements
+        put32(&mut img, PROTO_DESC_OFF + 16, 2); // NumRequirements
         put_i32(&mut img, PROTO_DESC_OFF + 20, 0); // AssociatedTypeNames
 
-        // ProtocolConformanceDescriptor: Demo : Named (direct type desc).
+        // Witness table pattern: Description + two requirement slots.
+        // Slot 0 points at a printable name string (resolves as witness name);
+        // slot 1 points at anonymous bytes (VA-only soft-fail).
         let conf_va = TEXT_VM + CONF_DESC_OFF as u64;
+        let wt_va = TEXT_VM + WITNESS_TBL_OFF as u64;
+        let w0_va = TEXT_VM + W0_NAME_OFF as u64;
+        let w1_va = TEXT_VM + W1_OFF as u64;
+        put(&mut img, W0_NAME_OFF, b"doNamed\0");
+        put(&mut img, W1_OFF, &[0xD5, 0x03, 0x20, 0x1F, 0, 0, 0, 0]); // RET + pad
+        put64(&mut img, WITNESS_TBL_OFF, conf_va); // Description
+        put64(&mut img, WITNESS_TBL_OFF + 8, w0_va);
+        put64(&mut img, WITNESS_TBL_OFF + 16, w1_va);
+
+        // ProtocolConformanceDescriptor: Demo : Named (direct type desc).
         put_i32(
             &mut img,
             CONF_DESC_OFF,
@@ -1378,7 +1597,11 @@ mod tests {
             CONF_DESC_OFF + 4,
             rel32(conf_va + 4, struct_va),
         ); // TypeRef (direct type descriptor)
-        put_i32(&mut img, CONF_DESC_OFF + 8, 0); // WitnessTablePattern
+        put_i32(
+            &mut img,
+            CONF_DESC_OFF + 8,
+            rel32(conf_va + 8, wt_va),
+        ); // WitnessTablePattern
         put32(
             &mut img,
             CONF_DESC_OFF + 12,
@@ -1490,6 +1713,19 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_recovers_witness_table_slots() {
+        let img = synthetic_swift_macho();
+        let mach = MachFile::parse(&img).unwrap();
+        let sw = recover(&mach, &img).expect("swift");
+        let conf = &sw.proto_conformances[0];
+        assert_eq!(conf.witnesses.len(), 2, "{:?}", conf.witnesses);
+        assert_eq!(conf.witnesses[0].va, TEXT_VM + W0_NAME_OFF as u64);
+        assert_eq!(conf.witnesses[0].name.as_deref(), Some("doNamed"));
+        assert_eq!(conf.witnesses[1].va, TEXT_VM + W1_OFF as u64);
+        assert_eq!(conf.witnesses[1].name, None); // VA-only soft-fail
+    }
+
+    #[test]
     fn render_lists_types_and_inventory() {
         let img = synthetic_swift_macho();
         let mach = MachFile::parse(&img).unwrap();
@@ -1501,6 +1737,8 @@ mod tests {
         assert!(text.contains("count : $sSi"), "{text}");
         assert!(text.contains("label : $sSS"), "{text}");
         assert!(text.contains("App.Demo : App.Named"), "{text}");
+        assert!(text.contains("witness "), "{text}");
+        assert!(text.contains("doNamed"), "{text}");
         assert!(text.contains("refl \"count\""), "{text}");
         assert!(text.contains("typeref \"$s3App4DemoV\""), "{text}");
     }
@@ -1556,9 +1794,31 @@ mod tests {
         assert_eq!(conf.protocol_name, None);
         assert_eq!(conf.type_name, None);
         assert_eq!(conf.flags, 0xDEAD_BEEF);
+        // Witness pattern still points at a readable table; heuristic walk
+        // recovers slots even when the protocol link is gone.
+        assert_eq!(conf.witnesses.len(), 2);
         let text = render(&sw, 16);
         assert!(text.contains("? : ?"), "{text}");
         assert!(text.contains("flags 0xdeadbeef"), "{text}");
+    }
+
+    #[test]
+    fn null_witness_pattern_yields_empty_witnesses() {
+        let mut img = synthetic_swift_macho();
+        put_i32(&mut img, CONF_DESC_OFF + 8, 0);
+        let mach = MachFile::parse(&img).unwrap();
+        let sw = recover(&mach, &img).unwrap();
+        assert_eq!(sw.proto_conformances.len(), 1);
+        assert!(sw.proto_conformances[0].witnesses.is_empty());
+    }
+
+    #[test]
+    fn witness_cap_truncates_without_panic() {
+        let img = synthetic_swift_macho();
+        let mach = MachFile::parse(&img).unwrap();
+        let sw = recover(&mach, &img).unwrap();
+        assert!(sw.proto_conformances[0].witnesses.len() <= MAX_WITNESSES_PER_CONFORMANCE);
+        const { assert!(MAX_WITNESSES_PER_CONFORMANCE >= 2); }
     }
 
     #[test]

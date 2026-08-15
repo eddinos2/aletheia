@@ -1,32 +1,31 @@
 # Adversarial fixture pack
 
-Place redistributable, **non-proprietary** samples here for scorecard runs.
-Do not commit malware, App Store IPA ciphertext, or licensed firmware.
+Redistributable samples for scorecard / FLIRT / diff benches.
+Generate or refresh with:
 
-## Layout
-
-```
-fixtures/adversarial/
-  README.md          (this file)
-  go_stripped/       # optional: tiny Go hello, stripped
-  rust_panic/        # optional: tiny Rust binary
-  macho_arm64/       # optional: thin arm64 Mach-O (no FairPlay)
-  version_pair/      # optional: old.bin + new.bin for diff/patch
+```console
+./scripts/gen-adversarial-fixtures.sh
 ```
 
-## Minimum for CI / smoke
+## Tracked layout
 
-In-tree `fixtures/diamond` and `fixtures/loop_bc` already cover CFG +
-decompile. Adversarial packs deepen library ID, Swift/ObjC, and version
-diff — add when you can redistribute the bytes.
+| Path | Role |
+|---|---|
+| `version_pair/{old,new}.bin` + `a.c`/`b.c` | patch-diff pair (tiny C) |
+| `baseline_diamond` | copy of `fixtures/diamond` for local scorecard |
+| `go_stripped/hello.go` | source; binary gitignored (rebuild via script) |
+| `rust_panic/main.rs` | source; binary gitignored |
+| `macho_arm64/` | placeholder for hand-added thin arm64 samples |
 
 ## Commands
 
 ```console
-./scripts/bench-smoke.sh
-cargo run --bin redump -- fixtures/diamond --typefacts=1
-cargo run --bin redump -- path/to/swift_app --swift
+cargo run --bin redump -- fixtures/adversarial/version_pair/old.bin \
+  --diff fixtures/adversarial/version_pair/new.bin
+cargo run --bin redump -- fixtures/adversarial/baseline_diamond --flirt
+cargo run --bin redump -- fixtures/adversarial/version_pair/old.bin \
+  --patch-from-diff fixtures/adversarial/version_pair/new.bin
 ```
 
-See [ADVERSARIAL_FIXTURES.md](../../docs/ADVERSARIAL_FIXTURES.md) and
-[SCORECARD.md](../../docs/SCORECARD.md).
+See [docs/ADVERSARIAL_FIXTURES.md](../../docs/ADVERSARIAL_FIXTURES.md) and
+[docs/SCORECARD.md](../../docs/SCORECARD.md).

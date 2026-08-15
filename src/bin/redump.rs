@@ -67,8 +67,8 @@ const USAGE: &str = "usage: redump <file> [--headers] [--sections] [--imports] [
   --objc[=N]    recover Objective-C classes and methods from Mach-O
                 __objc_classlist / method lists (default N=4096 classes)
   --swift[=N]   inventory Mach-O __swift5_* sections; recover type names /
-                fields from __swift5_types and protocol conformances from
-                __swift5_proto (default N=4096 types)
+                fields from __swift5_types and protocol conformances /
+                witness-table slots from __swift5_proto (default N=4096 types)
   --lift[=N]    lift the recovered program to the register-transfer IR and
                 print it (x86-64 and aarch64), for at most N functions
                 (default 4)
@@ -116,8 +116,8 @@ const USAGE: &str = "usage: redump <file> [--headers] [--sections] [--imports] [
                 explicit conflicts; refine sig params (default 4)
   --flirt[=path]
                 open FLIRT-style library ID (text corpus, not IDA .sig):
-                with no path, print the empty-corpus note; with a path,
-                load CRC32\\tNAME / hex-pattern lines and match functions
+                with no path, load testdata/flirt/sample.corpus when
+                present; with a path, load that CRC32\\tNAME / hex file
   --patch-nop=<va>
                 preview a same-length NOP PatchSet at VA (hex), hash-bound
   --patch-apply-nop=<va>
@@ -690,7 +690,16 @@ fn print_flirt(
         .map_err(io);
     }
 
-    // No path: honest empty-corpus note (open format docs; not IDA .sig).
+    // Default open corpus when no path given (ships in-tree).
+    let default_corpus = "testdata/flirt/sample.corpus";
+    let corpus_path = corpus_path.or_else(|| {
+        if std::path::Path::new(default_corpus).is_file() {
+            Some(default_corpus)
+        } else {
+            None
+        }
+    });
+
     let Some(corpus_path) = corpus_path else {
         let report = flirt::MatchReport {
             candidates: Vec::new(),
@@ -709,6 +718,7 @@ fn print_flirt(
     if let Err(e) = flirt::check_corpus(&corpus) {
         writeln!(out, "// corpus check failed: {e}").map_err(io)?;
     }
+    writeln!(out, "; corpus {corpus_path}").map_err(io)?;
     let image = aletheia::load(data).map_err(|e| format!("{path}: {e}"))?;
     let report = flirt::match_image(image.as_ref(), &corpus);
     if let Err(e) = flirt::check(&report) {
@@ -4843,7 +4853,7 @@ mod tests {
     }
 
     #[test]
-    fn flirt_without_corpus_dumps_empty_note() {
+    fn flirt_without_path_uses_default_or_empty_note() {
         let img = synthetic_elf64();
         let out = dump_to_string(
             &img,
@@ -4854,8 +4864,11 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("FLIRT"), "{out}");
-        assert!(out.contains("empty corpus"), "{out}");
-        assert!(out.contains("not IDA"), "{out}");
+        assert!(
+            out.contains("corpus testdata/flirt/sample.corpus")
+                || (out.contains("empty corpus") && out.contains("not IDA")),
+            "{out}"
+        );
     }
 
     #[test]
