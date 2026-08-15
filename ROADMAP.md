@@ -13,15 +13,11 @@ Ship an **open** binary-analysis engine that researchers can actually own:
 3. **Better defaults for modern binaries** — Go/Rust/C++, parallel
    analysis, git-native annotations, deterministic headless output.
 
-We are not a trademark parody of any commercial suite. We compete on
-**openness, agent integration, and engineering contracts** (determinism,
-provenance, clean-room) while deepening decompiler quality and Apple/iOS
-support over time.
+We compete on **openness, agent integration, and engineering contracts**
+(determinism, provenance, clean-room) while deepening decompiler quality
+and Apple/iOS support over time.
 
 ## Positioning
-
-General-purpose tools (IDA Pro, Ghidra, Binary Ninja) win on decades of
-breadth × depth. Aletheia wins early by refusing their structural debt:
 
 | Pain with incumbents | Aletheia answer |
 |---|---|
@@ -32,8 +28,7 @@ breadth × depth. Aletheia wins early by refusing their structural debt:
 | Weak Go/Rust story | First-class recoveries (deepening) |
 | Patching as opaque byte edits | Auditable PatchSet + sibling apply |
 
-**Depth-first:** PE + ELF + Mach-O × x86-64 + AArch64 before chasing
-firmware ISAs.
+**Depth-first:** PE + ELF + Mach-O × x86-64 + AArch64 before exotic ISAs.
 
 ## Architecture
 
@@ -57,12 +52,12 @@ firmware ISAs.
 
 ## Multi-track board (current)
 
-| Track | Focus | Near-term |
+| Track | Landed | Next |
 |---|---|---|
-| **Engine** | Readable decompile | `irstack` → signatures → MEM promote → types |
-| **iOS / Apple** | Modern Mach-O | chained fixup *walk* → ObjC → Swift |
-| **Patch / Diff** | Surgical research workflows | hunks → patch-from-diff → resign recipes |
-| **Agents / UI** | Automate RE | harden MCP → TUI → GUI |
+| **Engine** | irstack, sig, MEM promote, irtype evidence, boolmerge | type bounds → presentation; FLIRT corpus growth |
+| **iOS / Apple** | chained walk, ObjC classes/methods, Swift metadata stub | deeper Swift ABI; selector xrefs |
+| **Patch / Diff** | PatchSet, patch-from-diff, resign recipe stub | richer assemble; codesign recipe depth |
+| **Agents / UI** | MCP protocol fill, `--json` | TUI (Gate G1) → GUI |
 
 Gates: see [GATES.md](GATES.md).
 
@@ -75,19 +70,21 @@ Loaders, decoders, CFG/funcs/xrefs, parallel engine, open annotations.
 ### Phase 4 — Interface & scripting — in progress
 
 - [x] Symbolized listing (`redump --listing`)
-- [x] MCP skeleton (`aletheia-mcp`)
+- [x] MCP server (`aletheia-mcp`: open/decompile/diff/patch/listing/stack/xrefs/rename)
+- [x] Headless `--json` (functions)
 - [ ] TUI explorer
 - [ ] Stable scripting / plugin ABI
-- [ ] Documented headless batch contract (`--json`, etc.)
 
 ### Phase 5 — Differentiators + decompiler — in progress
 
 - [x] Go / Rust / C++ recoveries (partial depth)
 - [x] Binary diff (`--diff`)
-- [x] Decompiler spine through `--decompile`
-- [~] Stack slots (`irstack` landed; sig/types next)
-- [ ] FLIRT-style open signature corpus
-- [x] PatchSet preview/apply (early)
+- [x] Decompiler spine through `--decompile` (local_* + sig headers)
+- [x] Stack slots + MEM promote (`irstack` / `mempromote`)
+- [x] Callee/caller sig helpers + open FLIRT-style matcher (`flirt`)
+- [x] Type evidence (`irtype`)
+- [x] PatchSet preview/apply + patch-from-diff
+- [x] ObjC / Swift early recoveries
 
 ### Phase 6 — Poly-frontend — planned
 

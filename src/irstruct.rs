@@ -149,6 +149,19 @@
 //! duplications the output is bit-for-bit what the collapse alone
 //! produced.
 //!
+//! # Boolean merge — congruent conditions on a decided path
+//!
+//! After the re-split, a residual shape remains when jump threading
+//! duplicated a deciding block whose guard is [`crate::irflow::veq`]-
+//! congruent to a condition already true or false on that path: the
+//! copy still carries a nested `If` that always takes one arm. The
+//! boolean-merge fold collapses that nested `If` to the live arm,
+//! leaving the deciding block's plain leaf so the CFG edge into it
+//! stays realized. The other polarity's edge is realized at the sibling
+//! occurrence on the opposite path. [`check`] accepts a single-edge
+//! realization from a deciding leaf when an enclosing condition proves
+//! the polarity by `veq`. Diamond fixtures are untouched.
+//!
 //! # The schema catalog, tried in this order at each region head
 //!
 //! Cyclic before acyclic, and *graph-wide*: every loop header in the
@@ -221,7 +234,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::ir::{BranchKind, Expr, Stmt};
+use crate::ir::{BranchKind, Expr, Stmt, UnOp};
+use crate::irflow::{self, VnDefs};
 use crate::irout;
 use crate::irssa::{self, SsaBlock, SsaFunction};
 
@@ -499,6 +513,7 @@ fn structure_budgeted(
     }
     let copies = copy_edges(f);
     let root = resplit_tails(f, tables, &copies, root, &mut stats, MAX_TAIL_SPLITS);
+    let root = fold_boolean_merges(f, tables, root);
     (root, stats)
 }
 
@@ -2496,6 +2511,276 @@ fn resplit_tails(
     root
 }
 
+
+/// The branch guard of a conditional block, if it ends in a two-way
+/// `Branch` with a condition expression.
+fn branch_guard(f: &SsaFunction, va: u64) -> Option<&Expr> {
+    match f.blocks.get(&va)?.stmts.last()? {
+        Stmt::Branch {
+            kind: BranchKind::Jump,
+            cond: Some(g),
+            ..
+        } => Some(g),
+        _ => None,
+    }
+}
+
+/// When `known` is decided true/false, whether `guard` is forced true
+/// under [`irflow::veq`] (including a single outer `Not`).
+fn guard_forced_true(
+    known: &Expr,
+    known_true: bool,
+    guard: &Expr,
+    vn: Option<&VnDefs>,
+) -> Option<bool> {
+    if irflow::veq(known, guard, vn) {
+        return Some(known_true);
+    }
+    if let Expr::Unary {
+        op: UnOp::Not,
+        operand,
+    } = guard
+        && irflow::veq(known, operand, vn)
+    {
+        return Some(!known_true);
+    }
+    if let Expr::Unary {
+        op: UnOp::Not,
+        operand,
+    } = known
+        && irflow::veq(operand, guard, vn)
+    {
+        return Some(!known_true);
+    }
+    None
+}
+
+/// Whether an enclosing decided condition forces `block`'s branch to
+/// take its `taken` side (`Some(true)`), its fall-through (`Some(false)`),
+/// or neither (`None`).
+fn forced_taken_side(
+    f: &SsaFunction,
+    tables: &BTreeMap<u64, Vec<u64>>,
+    block: u64,
+    decided: &[(Expr, bool)],
+) -> Option<bool> {
+    let guard = branch_guard(f, block)?;
+    if !matches!(exits(f, tables, block), Exits::Cond { .. }) {
+        return None;
+    }
+    for (known, known_true) in decided {
+        if let Some(guard_true) = guard_forced_true(known, *known_true, guard, None) {
+            return Some(guard_true);
+        }
+    }
+    None
+}
+
+/// Collapse nested `If`s whose guard is `veq`-congruent to a condition
+/// already decided on the path — see the module docs.
+fn fold_boolean_merges(
+    f: &SsaFunction,
+    tables: &BTreeMap<u64, Vec<u64>>,
+    root: Node,
+) -> Node {
+    // Only collapse a deciding block when both polarities appear as
+    // candidates — otherwise a single-sided fold would uncover the
+    // dead successor.
+    let mut polarities: BTreeMap<u64, (bool, bool)> = BTreeMap::new();
+    collect_bool_folds(f, tables, &root, &mut Vec::new(), &mut polarities, 0);
+    let allowed: BTreeSet<u64> = polarities
+        .into_iter()
+        .filter(|(_, (take, fall))| *take && *fall)
+        .map(|(b, _)| b)
+        .collect();
+    if allowed.is_empty() {
+        return root;
+    }
+    fold_bool_node(f, tables, root, &mut Vec::new(), &allowed, 0)
+}
+
+fn collect_bool_folds(
+    f: &SsaFunction,
+    tables: &BTreeMap<u64, Vec<u64>>,
+    node: &Node,
+    decided: &mut Vec<(Expr, bool)>,
+    polarities: &mut BTreeMap<u64, (bool, bool)>,
+    depth: usize,
+) {
+    if depth > MAX_TREE_DEPTH {
+        return;
+    }
+    match node {
+        Node::Seq(v) => {
+            let mut i = 0;
+            while i < v.len() {
+                if i + 1 < v.len()
+                    && let Node::Block(b) = v[i]
+                    && let Node::If { cond, .. } = &v[i + 1]
+                    && b == cond.block
+                    && let Some(take_taken) = forced_taken_side(f, tables, b, decided)
+                {
+                    let e = polarities.entry(b).or_insert((false, false));
+                    if take_taken {
+                        e.0 = true;
+                    } else {
+                        e.1 = true;
+                    }
+                    i += 2;
+                    continue;
+                }
+                collect_bool_folds(f, tables, &v[i], decided, polarities, depth + 1);
+                i += 1;
+            }
+        }
+        Node::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            let pushed = branch_guard(f, cond.block).map(|g| (g.clone(), !cond.negated));
+            if let Some(p) = pushed.clone() {
+                decided.push(p);
+            }
+            collect_bool_folds(f, tables, then_body, decided, polarities, depth + 1);
+            if pushed.is_some() {
+                decided.pop();
+            }
+            if let Some(e) = else_body {
+                if let Some((g, t)) = pushed.clone() {
+                    decided.push((g, !t));
+                }
+                collect_bool_folds(f, tables, e, decided, polarities, depth + 1);
+                if pushed.is_some() {
+                    decided.pop();
+                }
+            }
+        }
+        Node::Loop { cond, body, .. } => {
+            let pushed = cond.and_then(|c| {
+                branch_guard(f, c.block).map(|g| (g.clone(), !c.negated))
+            });
+            if let Some(p) = pushed.clone() {
+                decided.push(p);
+            }
+            collect_bool_folds(f, tables, body, decided, polarities, depth + 1);
+            if pushed.is_some() {
+                decided.pop();
+            }
+        }
+        Node::Switch { cases, .. } => {
+            for (_, b) in cases {
+                collect_bool_folds(f, tables, b, decided, polarities, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn fold_bool_node(
+    f: &SsaFunction,
+    tables: &BTreeMap<u64, Vec<u64>>,
+    node: Node,
+    decided: &mut Vec<(Expr, bool)>,
+    allowed: &BTreeSet<u64>,
+    depth: usize,
+) -> Node {
+    if depth > MAX_TREE_DEPTH {
+        return node;
+    }
+    match node {
+        Node::Seq(v) => {
+            let mut out = Vec::with_capacity(v.len());
+            let mut i = 0;
+            while i < v.len() {
+                if i + 1 < v.len()
+                    && let Node::Block(b) = v[i]
+                    && let Node::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    } = &v[i + 1]
+                    && b == cond.block
+                    && allowed.contains(&b)
+                    && let Some(take_taken) = forced_taken_side(f, tables, b, decided)
+                {
+                    let live_then = take_taken != cond.negated;
+                    let arm = if live_then {
+                        then_body.as_ref().clone()
+                    } else {
+                        else_body
+                            .as_ref()
+                            .map(|e| e.as_ref().clone())
+                            .unwrap_or(Node::Seq(Vec::new()))
+                    };
+                    out.push(Node::Block(b));
+                    out.push(fold_bool_node(f, tables, arm, decided, allowed, depth + 1));
+                    i += 2;
+                    continue;
+                }
+                let n = fold_bool_node(f, tables, v[i].clone(), decided, allowed, depth + 1);
+                out.push(n);
+                i += 1;
+            }
+            if out.len() == 1 {
+                out.pop().unwrap_or(Node::Seq(Vec::new()))
+            } else {
+                Node::Seq(out)
+            }
+        }
+        Node::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            let pushed = branch_guard(f, cond.block).map(|g| (g.clone(), !cond.negated));
+            if let Some(p) = pushed.clone() {
+                decided.push(p);
+            }
+            let then_body = Box::new(fold_bool_node(f, tables, *then_body, decided, allowed, depth + 1));
+            if pushed.is_some() {
+                decided.pop();
+            }
+            let else_body = else_body.map(|e| {
+                if let Some((g, t)) = pushed.clone() {
+                    decided.push((g, !t));
+                }
+                let e = Box::new(fold_bool_node(f, tables, *e, decided, allowed, depth + 1));
+                if pushed.is_some() {
+                    decided.pop();
+                }
+                e
+            });
+            Node::If {
+                cond,
+                then_body,
+                else_body,
+            }
+        }
+        Node::Loop { kind, cond, body } => {
+            let pushed = cond.and_then(|c| {
+                branch_guard(f, c.block).map(|g| (g.clone(), !c.negated))
+            });
+            if let Some(p) = pushed.clone() {
+                decided.push(p);
+            }
+            let body = Box::new(fold_bool_node(f, tables, *body, decided, allowed, depth + 1));
+            if pushed.is_some() {
+                decided.pop();
+            }
+            Node::Loop { kind, cond, body }
+        }
+        Node::Switch { block, cases } => Node::Switch {
+            block,
+            cases: cases
+                .into_iter()
+                .map(|(t, b)| (t, fold_bool_node(f, tables, b, decided, allowed, depth + 1)))
+                .collect(),
+        },
+        other => other,
+    }
+}
+
 /// The block a node's entry reaches, by the verifier's rule minus the
 /// loop context (`Break`/`Continue` resolve to nothing here) — enough
 /// to recompute a rewritten loop's kind against the same header the
@@ -2555,6 +2840,8 @@ struct Verifier<'a> {
     /// realize to exactly the untaken side. Anything else funnels both
     /// polarities one way — a [`StructFault::Polarity`].
     owed: BTreeMap<u64, u64>,
+    /// Guards decided true/false on the path (boolean-merge witness).
+    decided: Vec<(Expr, bool)>,
     fault: Option<StructFault>,
 }
 
@@ -2712,6 +2999,7 @@ impl Verifier<'_> {
         if self.expected.get(&b).is_some_and(|s| !s.is_empty()) {
             if matches!(exits(self.f, self.tables, b), Exits::Cond { .. })
                 && !self.loop_conds.contains(&b)
+                && forced_taken_side(self.f, self.tables, b, &self.decided).is_none()
             {
                 self.undecided.insert(b);
             }
@@ -2755,7 +3043,14 @@ impl Verifier<'_> {
         if then_entry.is_some_and(|e| e != then_t) {
             self.fail(StructFault::Polarity { block: cond.block });
         }
+        let pushed = branch_guard(self.f, cond.block).map(|g| (g.clone(), !cond.negated));
+        if let Some(p) = pushed.clone() {
+            self.decided.push(p);
+        }
         let mut out = self.walk(then_body, pending.clone(), ctx, depth + 1);
+        if pushed.is_some() {
+            self.decided.pop();
+        }
         match else_body {
             Some(e) => {
                 let else_entry = self.entry_target(e, ctx, depth + 1);
@@ -2765,7 +3060,13 @@ impl Verifier<'_> {
                 if then_entry.is_none() && else_entry.is_none() {
                     self.fail(StructFault::Polarity { block: cond.block });
                 }
+                if let Some((g, t)) = pushed.clone() {
+                    self.decided.push((g, !t));
+                }
                 out.extend(self.walk(e, pending, ctx, depth + 1));
+                if pushed.is_some() {
+                    self.decided.pop();
+                }
                 if let Some(req) = suspended {
                     self.owed.insert(cond.block, req);
                 }
@@ -2937,6 +3238,7 @@ pub fn check(
         undecided: BTreeSet::new(),
         loop_conds: Vec::new(),
         owed: BTreeMap::new(),
+        decided: Vec::new(),
         fault: None,
     };
     let ctx = Ctx {
@@ -3362,6 +3664,99 @@ mod tests {
              else\n\
              \x20 block loc_1010\n\
              block loc_1030\n"
+        );
+    }
+
+    /// Shared latch whose guard is byte-identical to the entry's — the
+    /// shape boolean merge collapses after threading has duplicated it.
+    fn congruent_retest() -> irlift::LiftedFunction {
+        let rax_eq1 = || {
+            Expr::binary(BinOp::Eq, read(ra(0, Width::W64)), c(1, Width::W64))
+        };
+        let br = |cond: Expr, target: u64| Stmt::Branch {
+            kind: BranchKind::Jump,
+            cond: Some(cond),
+            target: c(target, Width::W64),
+        };
+        func(
+            0x1000,
+            vec![
+                block(0x1000, vec![br(rax_eq1(), 0x1010)], vec![0x1010, 0x1020]),
+                block(
+                    0x1010,
+                    vec![assign(ra(1, Width::W64), c(1, Width::W64)), jmp(0x1030)],
+                    vec![0x1030],
+                ),
+                block(
+                    0x1020,
+                    vec![assign(ra(1, Width::W64), c(2, Width::W64)), jmp(0x1030)],
+                    vec![0x1030],
+                ),
+                block(0x1030, vec![br(rax_eq1(), 0x1040)], vec![0x1040, 0x1050]),
+                block(0x1040, vec![ret()], vec![]),
+                block(0x1050, vec![ret()], vec![]),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_veq_congruent_retest_collapses_the_nested_if() {
+        let ssa = build(&congruent_retest());
+        // Hand-built post-threading shape: the latch is duplicated into
+        // both arms, each still carrying a nested `If` on the same guard.
+        let nested = Node::Seq(vec![
+            Node::Block(0x1000),
+            Node::If {
+                cond: Cond {
+                    block: 0x1000,
+                    negated: false,
+                },
+                then_body: Box::new(Node::Seq(vec![
+                    Node::Block(0x1010),
+                    Node::Block(0x1030),
+                    Node::If {
+                        cond: Cond {
+                            block: 0x1030,
+                            negated: false,
+                        },
+                        then_body: Box::new(Node::Block(0x1040)),
+                        else_body: Some(Box::new(Node::Block(0x1050))),
+                    },
+                ])),
+                else_body: Some(Box::new(Node::Seq(vec![
+                    Node::Block(0x1020),
+                    Node::Block(0x1030),
+                    Node::If {
+                        cond: Cond {
+                            block: 0x1030,
+                            negated: false,
+                        },
+                        then_body: Box::new(Node::Block(0x1040)),
+                        else_body: Some(Box::new(Node::Block(0x1050))),
+                    },
+                ]))),
+            },
+        ]);
+        assert_eq!(check(&ssa, &no_tables(), &nested), Ok(()));
+        let folded = fold_boolean_merges(&ssa, &no_tables(), nested);
+        assert_eq!(check(&ssa, &no_tables(), &folded), Ok(()), "fold must keep check");
+        let rendered = render(&ssa, &folded);
+        assert!(
+            !rendered.contains("if cond loc_1030") && !rendered.contains("if !cond loc_1030"),
+            "nested retest must fold away: {rendered}"
+        );
+        assert_eq!(rendered.matches("block loc_1030").count(), 2, "{rendered}");
+        assert!(rendered.contains("block loc_1040"), "{rendered}");
+        assert!(rendered.contains("block loc_1050"), "{rendered}");
+        // No residual goto — each arm falls into its live successor.
+        assert!(!rendered.contains("goto"), "{rendered}");
+        // Diamond fixture must stay an if/else with both arms — no fold.
+        let (dssa, droot, dstats) = tree(&diamond());
+        assert_eq!(dstats.gotos, 0);
+        let d = text(&dssa, &droot);
+        assert!(
+            d.contains("if cond loc_1000") && d.contains("else"),
+            "diamond must remain if/else: {d}"
         );
     }
 

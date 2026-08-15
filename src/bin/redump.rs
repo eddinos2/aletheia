@@ -23,9 +23,9 @@ use aletheia::pe::exports::{ExportDirectory, ExportTarget};
 use aletheia::pe::{ImportSymbol, ImportedDll, Machine, PeFile, PeFormat, Section, directory_index};
 use aletheia::model::Arch;
 use aletheia::{
-    aarch64, annotate, callfx, cfg, devirt, diff, gostrings, gotype, irlift, irout, irssa,
-    irssaopt, irstruct, irstack, jumptable, listing, mempromote, patch, pseudo, rustmeta, sig,
-    vtable, x86,
+    aarch64, annotate, callfx, cfg, devirt, diff, flirt, funcs, gostrings, gotype, irlift, irout,
+    irssa, irssaopt, irstruct, irstack, irtype, jumptable, listing, mempromote, objc, patch, pseudo,
+    rustmeta, sig, swift, types, vtable, x86,
 };
 
 const USAGE: &str = "usage: redump <file> [--headers] [--sections] [--imports] [--symbols] [--exports] [--disasm[=N]] [--listing[=N]] [--db <path>] [--diff <new>]
@@ -64,6 +64,10 @@ const USAGE: &str = "usage: redump <file> [--headers] [--sections] [--imports] [
   --gostrings   recover Go string literals by their (pointer, length)
                 references, with exact boundaries the C-string scanner
                 cannot get on packed, unterminated Go string data
+  --objc[=N]    recover Objective-C classes and methods from Mach-O
+                __objc_classlist / method lists (default N=4096 classes)
+  --swift[=N]   inventory Mach-O __swift5_* sections and recover nominal
+                type names from __swift5_types (default N=4096 types)
   --lift[=N]    lift the recovered program to the register-transfer IR and
                 print it (x86-64 and aarch64), for at most N functions
                 (default 4)
@@ -105,15 +109,29 @@ const USAGE: &str = "usage: redump <file> [--headers] [--sections] [--imports] [
                 N functions (default 4)
   --sigs[=N]    callee-side signature recovery (DESIGN sig), up to
                 N functions (default 4)
+  --typefacts[=N]
+                SSA type-evidence facts (DESIGN irtype): load/store
+                widths, signedness hints, pointer address uses; refine
+                sig params when possible (default 4 functions)
+  --flirt[=path]
+                open FLIRT-style library ID (text corpus, not IDA .sig):
+                with no path, print the empty-corpus note; with a path,
+                load CRC32\\tNAME / hex-pattern lines and match functions
   --patch-nop=<va>
                 preview a same-length NOP PatchSet at VA (hex), hash-bound
   --patch-apply-nop=<va>
                 apply that PatchSet to sibling <file>.patched
+  --patch-from-diff <new>
+                Diff <file> against <new>, build PatchSet from Modified
+                hunks (preview); pair with --patch-apply for sibling write
+  --patch-apply  with --patch-nop / --patch-from-diff: write sibling
+                <file>.patched after a successful preview
+  --json        headless functions list (deterministic JSON + stamp)
 
 With no selective flag, everything except --disasm, --listing, --diff,
---vtables, --rustmeta, --gotypes, --devirt, --gostrings, --lift,
---simplify, --ssa, --ssa-opt, --structure, --decompile, --stack,
---promote, and --sigs is dumped.";
+--vtables, --rustmeta, --gotypes, --devirt, --gostrings, --objc, --swift,
+--lift, --simplify, --ssa, --ssa-opt, --structure, --decompile, --stack,
+--promote, --sigs, --typefacts, --flirt, --patch-from-diff, and --json is dumped.";
 
 /// Instructions swept by `--disasm` when no count is given.
 const DEFAULT_DISASM_COUNT: usize = 32;
@@ -122,6 +140,12 @@ const DEFAULT_DISASM_COUNT: usize = 32;
 /// own default cap, so the flag inherits the renderer's contract rather
 /// than inventing a second one.
 const DEFAULT_LISTING_FUNCTIONS: usize = 4096;
+
+/// ObjC classes listed by `--objc` when no count is given.
+const DEFAULT_OBJC_CLASSES: usize = objc::DEFAULT_MAX_CLASSES;
+
+/// Swift types listed by `--swift` when no count is given.
+const DEFAULT_SWIFT_TYPES: usize = swift::DEFAULT_MAX_TYPES;
 
 /// Functions lifted to IR by `--lift` when no count is given. IR is far
 /// more voluminous per function than a listing, so the default is small.
@@ -150,6 +174,10 @@ struct Options {
     devirt: bool,
     /// Recover Go string literals by their (pointer, length) references.
     gostrings: bool,
+    /// `Some(n)`: recover and list ObjC classes, up to `n` classes.
+    objc: Option<usize>,
+    /// `Some(n)`: inventory Swift metadata / types, up to `n` types.
+    swift: Option<usize>,
     /// `Some(n)`: lift the recovered program to IR, up to `n` functions.
     lift: Option<usize>,
     /// Simplify the lifted IR through the dataflow passes before
@@ -172,10 +200,17 @@ struct Options {
     promote: Option<usize>,
     /// `Some(n)`: dump callee-side signatures for up to `n` functions.
     sigs: Option<usize>,
+    /// `Some(n)`: dump SSA type-evidence facts for up to `n` functions.
+    typefacts: Option<usize>,
+    /// Open FLIRT-style dump selected (`--flirt` / `--flirt=path`).
+    /// Corpus path lives beside `--db` in the parse result.
+    flirt: bool,
     /// Preview a 4-byte NOP PatchSet at this VA (aarch64 NOP / x86 0x90).
     patch_nop: Option<u64>,
-    /// When set with `patch_nop`, apply to sibling `*.patched`.
+    /// When set with `patch_nop` / `--patch-from-diff`, apply to sibling `*.patched`.
     patch_apply: bool,
+    /// Headless deterministic functions JSON (selection).
+    json: bool,
     /// True when no selective flag was given, i.e. "dump everything".
     all: bool,
 }
@@ -232,7 +267,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let (path, opts, db_path, diff_path) = parse_args()?;
+    let (path, opts, db_path, diff_path, patch_from_diff, flirt_path) = parse_args()?;
     let data = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
     // The database is read and parsed before any output: a bad `--db`
     // is a usage error, and reporting it after half a dump has been
@@ -246,10 +281,18 @@ fn run() -> Result<(), String> {
     };
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    dump(&path, &data, opts, db.as_ref(), &mut out)?;
+    if opts.json {
+        print_functions_json(&path, &data, &mut out)?;
+    } else {
+        dump(&path, &data, opts, db.as_ref(), flirt_path.as_deref(), &mut out)?;
+    }
     if let Some(new_path) = diff_path {
         let new_data = std::fs::read(&new_path).map_err(|e| format!("{new_path}: {e}"))?;
         print_diff(&path, &data, &new_path, &new_data, &mut out)?;
+    }
+    if let Some(new_path) = patch_from_diff {
+        let new_data = std::fs::read(&new_path).map_err(|e| format!("{new_path}: {e}"))?;
+        print_patch_from_diff(&path, &data, &new_path, &new_data, opts.patch_apply, &mut out)?;
     }
     Ok(())
 }
@@ -282,6 +325,124 @@ fn print_diff(
     out.write_all(diff::render(&d).as_bytes()).map_err(io)
 }
 
+/// Build a PatchSet from Modified diff hunks: preview always; optional sibling apply.
+fn print_patch_from_diff(
+    old_path: &str,
+    old_data: &[u8],
+    new_path: &str,
+    new_data: &[u8],
+    apply: bool,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("{old_path}: {e}");
+    writeln!(out, "\nPATCH-FROM-DIFF (against {new_path})").map_err(io)?;
+
+    let old_image = aletheia::load(old_data).map_err(|e| format!("{old_path}: {e}"))?;
+    let old_program = cfg::recover(old_image.as_ref()).map_err(|e| format!("{old_path}: {e}"))?;
+    let new_image = aletheia::load(new_data).map_err(|e| format!("{new_path}: {e}"))?;
+    let new_program = cfg::recover(new_image.as_ref()).map_err(|e| format!("{new_path}: {e}"))?;
+
+    let d = diff::diff(
+        old_image.as_ref(),
+        &old_program,
+        new_image.as_ref(),
+        &new_program,
+    );
+    let mut set = patch::patchset_from_modified(
+        old_image.as_ref(),
+        new_image.as_ref(),
+        &d,
+        patch::DEFAULT_HUNK_CAP,
+    );
+    if matches!(sniff_format(old_data), Some(Format::MachO)) {
+        set = set.with_macho_resign_recipe(old_path);
+    }
+    match set.preview(old_image.as_ref()) {
+        Ok(report) => out.write_all(report.as_bytes()).map_err(io)?,
+        Err(patch::PatchFault::Empty) => {
+            writeln!(out, "; no same-length Modified hunk edits").map_err(io)?;
+            return Ok(());
+        }
+        Err(e) => return Err(format!("{old_path}: patch preview: {e}")),
+    }
+    if apply {
+        let out_path = set
+            .apply_sibling(old_image.as_ref(), std::path::Path::new(old_path))
+            .map_err(|e| format!("{old_path}: patch apply: {e}"))?;
+        writeln!(out, "; wrote {}", out_path.display()).map_err(io)?;
+    }
+    Ok(())
+}
+
+/// Deterministic headless functions JSON (`--json`). Separate from listing /
+/// decompile text paths so those can evolve without fighting this contract.
+fn print_functions_json(
+    path: &str,
+    data: &[u8],
+    out: &mut impl Write,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("{path}: {e}");
+    if sniff_format(data) == Some(Format::MachOFat) {
+        return Err(format!(
+            "{path}: --json needs a thin image (extract a fat slice first)"
+        ));
+    }
+    let image = aletheia::load(data).map_err(|e| format!("{path}: {e}"))?;
+    let program = cfg::recover(image.as_ref()).map_err(|e| format!("{path}: {e}"))?;
+    let sources: std::collections::BTreeMap<u64, funcs::Source> = funcs::discover(image.as_ref())
+        .into_iter()
+        .map(|f| (f.va, f.source))
+        .collect();
+    let hash = patch::fnv1a64(data);
+    let mut items = Vec::new();
+    for (&va, func) in &program.functions {
+        let name = match &func.name {
+            Some(n) => format!(r#""{}""#, json_escape(n)),
+            None => "null".into(),
+        };
+        let source = sources
+            .get(&va)
+            .map(funcs_source_label)
+            .unwrap_or("cfg");
+        items.push(format!(
+            r#"{{"va":"0x{va:x}","name":{name},"source":"{source}"}}"#
+        ));
+    }
+    let body = format!(
+        r#"{{"functions":[{}],"total":{},"stamp":{{"hash":"0x{hash:x}","engine_version":"{}"}}}}"#,
+        items.join(","),
+        program.functions.len(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    writeln!(out, "{body}").map_err(io)
+}
+
+fn funcs_source_label(source: &funcs::Source) -> &'static str {
+    match source {
+        funcs::Source::EntryPoint => "entry",
+        funcs::Source::Symbol => "symbol",
+        funcs::Source::Unwind => "unwind",
+        funcs::Source::GoPclntab => "gopclntab",
+        funcs::Source::Prologue => "prologue",
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Detect the format of `data` and dump it to `out`. This is the whole
 /// program minus argv and file I/O, so tests can drive it directly.
 ///
@@ -296,6 +457,7 @@ fn dump(
     data: &[u8],
     opts: Options,
     db: Option<&annotate::Db>,
+    flirt_path: Option<&str>,
     out: &mut impl Write,
 ) -> Result<(), String> {
     let format = sniff_format(data);
@@ -329,6 +491,12 @@ fn dump(
     if opts.gostrings {
         print_gostrings(path, data, format, out)?;
     }
+    if let Some(max) = opts.objc {
+        print_objc(path, data, format, max, out)?;
+    }
+    if let Some(max) = opts.swift {
+        print_swift(path, data, format, max, out)?;
+    }
     if let Some(max) = opts.lift {
         print_lift(path, data, format, max, opts.simplify, out)?;
     }
@@ -352,6 +520,12 @@ fn dump(
     }
     if let Some(max) = opts.sigs {
         print_sigs(path, data, format, max, out)?;
+    }
+    if let Some(max) = opts.typefacts {
+        print_typefacts(path, data, format, max, out)?;
+    }
+    if opts.flirt {
+        print_flirt(path, data, format, flirt_path, out)?;
     }
     if let Some(va) = opts.patch_nop {
         print_patch_nop(path, data, format, va, opts.patch_apply, out)?;
@@ -420,6 +594,19 @@ fn print_promote(
             writeln!(out, "// promote check failed: {e}").map_err(io)?;
         }
         out.write_all(facts.render().as_bytes()).map_err(io)?;
+        // DESIGN 11 lite: rewrite Promote slots into SSA values / φ.
+        let applied = mempromote::apply(&swept, &facts);
+        if let Err(e) = mempromote::check_applied(&swept, &applied, &facts) {
+            writeln!(out, "// promote apply check failed: {e}").map_err(io)?;
+        }
+        if facts
+            .slots
+            .iter()
+            .any(|s| s.decision == mempromote::Decision::Promote)
+        {
+            out.write_all(irssa::render(&applied).as_bytes())
+                .map_err(io)?;
+        }
     }
     Ok(())
 }
@@ -480,6 +667,117 @@ fn print_sigs(
             writeln!(out, "// check failed: {e}").map_err(io)?;
         }
         out.write_all(facts.render().as_bytes()).map_err(io)?;
+    }
+    Ok(())
+}
+
+fn print_flirt(
+    path: &str,
+    data: &[u8],
+    format: Option<Format>,
+    corpus_path: Option<&str>,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("{path}: {e}");
+    writeln!(out, "\nFLIRT").map_err(io)?;
+    if format == Some(Format::MachOFat) {
+        return writeln!(
+            out,
+            "  (a fat container holds no single image; extract a slice first)"
+        )
+        .map_err(io);
+    }
+
+    // No path: honest empty-corpus note (open format docs; not IDA .sig).
+    let Some(corpus_path) = corpus_path else {
+        let report = flirt::MatchReport {
+            candidates: Vec::new(),
+            capped: false,
+            corpus_empty: true,
+        };
+        if let Err(e) = flirt::check(&report) {
+            writeln!(out, "// check failed: {e}").map_err(io)?;
+        }
+        return out
+            .write_all(flirt::render(&report).as_bytes())
+            .map_err(io);
+    };
+
+    let corpus = flirt::load_corpus(std::path::Path::new(corpus_path))?;
+    if let Err(e) = flirt::check_corpus(&corpus) {
+        writeln!(out, "// corpus check failed: {e}").map_err(io)?;
+    }
+    let image = aletheia::load(data).map_err(|e| format!("{path}: {e}"))?;
+    let report = flirt::match_image(image.as_ref(), &corpus);
+    if let Err(e) = flirt::check(&report) {
+        writeln!(out, "// check failed: {e}").map_err(io)?;
+    }
+    out.write_all(flirt::render(&report).as_bytes()).map_err(io)
+}
+
+fn print_typefacts(
+    path: &str,
+    data: &[u8],
+    format: Option<Format>,
+    max_functions: usize,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("{path}: {e}");
+    writeln!(out, "\nTYPE FACTS").map_err(io)?;
+    if format == Some(Format::MachOFat) {
+        return writeln!(
+            out,
+            "  (a fat container holds no single image; extract a slice first)"
+        )
+        .map_err(io);
+    }
+    let image = aletheia::load(data).map_err(|e| format!("{path}: {e}"))?;
+    if !matches!(image.arch(), Arch::X86_64 | Arch::Aarch64) {
+        return writeln!(out, "  (type facts need x86-64 or aarch64)").map_err(io);
+    }
+    if let Ok(mach) = aletheia::macho::MachFile::parse(data)
+        && mach.is_encrypted()
+    {
+        writeln!(
+            out,
+            "// warning: encrypted segment (cryptid!=0) — analysis may be garbage"
+        )
+        .map_err(io)?;
+    }
+    let folded =
+        jumptable::resolve_folded(image.as_ref()).map_err(|e| format!("{path}: {e}"))?;
+    let program = folded.program;
+    for func in program.functions.values().take(max_functions) {
+        let Some(lifted) = irlift::lift_function(image.as_ref(), func) else {
+            continue;
+        };
+        let lifted = match callfx::abi_for(image.arch()) {
+            Some(abi) => callfx::apply(&lifted, &abi),
+            None => lifted,
+        };
+        let ssa = match irssa::construct(&lifted) {
+            Ok(s) => s,
+            Err(e) => {
+                writeln!(out, "// sub_{:x}: no ssa ({e})", lifted.entry).map_err(io)?;
+                continue;
+            }
+        };
+        let (opt, _) = irssaopt::optimize(&ssa);
+        let (fwd, _) = irssaopt::forward(&opt);
+        let live_out = callfx::function_live_out(image.arch()).unwrap_or_default();
+        let (swept, _) = irssaopt::eliminate_dead(&fwd, &live_out);
+        let facts = irtype::collect(&swept);
+        if let Err(e) = irtype::check(&swept, &facts) {
+            writeln!(out, "// typefacts check failed: {e}").map_err(io)?;
+        }
+        out.write_all(facts.render().as_bytes()).map_err(io)?;
+        let sig = sig::recover(&swept);
+        let mut table = types::TypeTable::new();
+        let map = irtype::attach_sig_with_evidence(&swept, &sig, &facts, &mut table);
+        if let Err(e) = types::check(&table, Some(&map)) {
+            writeln!(out, "// types check failed: {e}").map_err(io)?;
+        }
+        out.write_all(map.render(&table).as_bytes()).map_err(io)?;
     }
     Ok(())
 }
@@ -670,13 +968,22 @@ fn print_decompile(
         let (fwd, _) = irssaopt::forward(&opt);
         let live_out = callfx::function_live_out(image.arch()).unwrap_or_default();
         let (swept, _) = irssaopt::eliminate_dead(&fwd, &live_out);
+        let stack = irstack::analyze(&swept);
+        let promote = mempromote::promote(&swept, &stack);
+        let swept = mempromote::apply(&swept, &promote);
+        let signature = sig::recover(&swept);
         let (root, stats) = irstruct::structure(&swept, &tables);
         if stats.capped {
             writeln!(out, "// note: structuring capped, remainder is gotos").map_err(io)?;
         }
         let (vars, _) = irout::out_of_ssa(&swept);
-        out.write_all(pseudo::render(&swept, &root, &vars).as_bytes())
-            .map_err(io)?;
+        let names = mempromote::var_namer(&swept, &stack, &promote, &vars.var_of);
+        let namer = |v: u32| names.get(&v).cloned();
+        let header = signature.render_header();
+        out.write_all(
+            pseudo::render_with_proto(&swept, &root, &vars, &namer, Some(&header)).as_bytes(),
+        )
+        .map_err(io)?;
     }
     Ok(())
 }
@@ -964,6 +1271,76 @@ fn print_gostrings(
         .map_err(io)
 }
 
+/// Recover Objective-C classes/methods from Mach-O `__objc_*` sections.
+fn print_objc(
+    path: &str,
+    data: &[u8],
+    format: Option<Format>,
+    max_classes: usize,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("{path}: {e}");
+    writeln!(out, "\nOBJECTIVE-C CLASSES").map_err(io)?;
+    match format {
+        Some(Format::MachOFat) => {
+            return writeln!(
+                out,
+                "  (a fat container holds no single image; extract a slice and dump that)"
+            )
+            .map_err(io);
+        }
+        Some(Format::MachO) => {}
+        _ => {
+            return writeln!(
+                out,
+                "  (ObjC metadata is a Mach-O section feature; not applicable here)"
+            )
+            .map_err(io);
+        }
+    }
+
+    let mach = MachFile::parse(data).map_err(|e| format!("{path}: {e}"))?;
+    let image = objc::recover_capped(&mach, data, max_classes)
+        .map_err(|e| format!("{path}: objc: {e}"))?;
+    out.write_all(objc::render(&image, max_classes).as_bytes())
+        .map_err(io)
+}
+
+/// Inventory Swift `__swift5_*` sections and recover type names.
+fn print_swift(
+    path: &str,
+    data: &[u8],
+    format: Option<Format>,
+    max_types: usize,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("{path}: {e}");
+    writeln!(out, "\nSWIFT METADATA").map_err(io)?;
+    match format {
+        Some(Format::MachOFat) => {
+            return writeln!(
+                out,
+                "  (a fat container holds no single image; extract a slice and dump that)"
+            )
+            .map_err(io);
+        }
+        Some(Format::MachO) => {}
+        _ => {
+            return writeln!(
+                out,
+                "  (Swift metadata is a Mach-O section feature; not applicable here)"
+            )
+            .map_err(io);
+        }
+    }
+
+    let mach = MachFile::parse(data).map_err(|e| format!("{path}: {e}"))?;
+    let image = swift::recover_capped(&mach, data, max_types)
+        .map_err(|e| format!("{path}: swift: {e}"))?;
+    out.write_all(swift::render(&image, max_types).as_bytes())
+        .map_err(io)
+}
+
 /// Resolve virtual/indirect calls against recovered vtables and render.
 fn print_devirt(
     path: &str,
@@ -1094,7 +1471,16 @@ fn print_listing(
 }
 
 /// Parse `<file>` plus the selective flags from `std::env::args`.
-fn parse_args() -> Result<(String, Options, Option<String>, Option<String>), String> {
+type ParseArgsOk = (
+    String,
+    Options,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn parse_args() -> Result<ParseArgsOk, String> {
     parse_args_from(std::env::args().skip(1))
 }
 
@@ -1102,17 +1488,17 @@ fn parse_args() -> Result<(String, Options, Option<String>, Option<String>), Str
 /// a process. With no selective flag every part (except the disassembly
 /// and the listing) is selected.
 ///
-/// Returns the input path, the selection, the `--db` path, and the
-/// `--diff` path when each was given. The database is a *modifier*, not
-/// a selection, so it does not by itself suppress the default "dump
-/// everything"; `--diff` *is* a selection (its output is the point of
-/// the invocation), so it does.
-fn parse_args_from<I: Iterator<Item = String>>(
-    args: I,
-) -> Result<(String, Options, Option<String>, Option<String>), String> {
+/// Returns the input path, the selection, the `--db` path, the `--diff`
+/// path, the `--patch-from-diff` path, and the `--flirt` corpus path when
+/// each was given. The database is a *modifier*, not a selection, so it
+/// does not by itself suppress the default "dump everything"; `--diff` /
+/// `--patch-from-diff` / `--json` / `--flirt` *are* selections.
+fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<ParseArgsOk, String> {
     let mut path = None;
     let mut db = None;
     let mut diff = None;
+    let mut patch_from_diff = None;
+    let mut flirt_path = None;
     let mut opts = Options {
         headers: false,
         sections: false,
@@ -1126,19 +1512,24 @@ fn parse_args_from<I: Iterator<Item = String>>(
         gotypes: false,
         devirt: false,
         gostrings: false,
+        objc: None,
+        swift: None,
         lift: None,
         simplify: false,
         ssa: None,
         ssa_opt: None,
         structure: None,
-            decompile: None,
-            stack: None,
-            promote: None,
-            sigs: None,
-            patch_nop: None,
-            patch_apply: false,
-            all: false,
-        };
+        decompile: None,
+        stack: None,
+        promote: None,
+        sigs: None,
+        typefacts: None,
+        flirt: false,
+        patch_nop: None,
+        patch_apply: false,
+        json: false,
+        all: false,
+    };
     let mut any_flag = false;
     let mut args = args.peekable();
 
@@ -1158,6 +1549,8 @@ fn parse_args_from<I: Iterator<Item = String>>(
             "--gotypes" => (opts.gotypes, any_flag) = (true, true),
             "--devirt" => (opts.devirt, any_flag) = (true, true),
             "--gostrings" => (opts.gostrings, any_flag) = (true, true),
+            "--objc" => (opts.objc, any_flag) = (Some(DEFAULT_OBJC_CLASSES), true),
+            "--swift" => (opts.swift, any_flag) = (Some(DEFAULT_SWIFT_TYPES), true),
             "--lift" => (opts.lift, any_flag) = (Some(DEFAULT_LIFT_FUNCTIONS), true),
             "--simplify" => (opts.simplify, any_flag) = (true, true),
             "--ssa" => (opts.ssa, any_flag) = (Some(DEFAULT_LIFT_FUNCTIONS), true),
@@ -1167,6 +1560,13 @@ fn parse_args_from<I: Iterator<Item = String>>(
             "--stack" => (opts.stack, any_flag) = (Some(DEFAULT_LIFT_FUNCTIONS), true),
             "--promote" => (opts.promote, any_flag) = (Some(DEFAULT_LIFT_FUNCTIONS), true),
             "--sigs" => (opts.sigs, any_flag) = (Some(DEFAULT_LIFT_FUNCTIONS), true),
+            "--typefacts" => (opts.typefacts, any_flag) = (Some(DEFAULT_LIFT_FUNCTIONS), true),
+            "--flirt" => (opts.flirt, any_flag) = (true, true),
+            "--json" => (opts.json, any_flag) = (true, true),
+            "--patch-apply" => {
+                opts.patch_apply = true;
+                any_flag = true;
+            }
             flag if flag.starts_with("--patch-nop=") => {
                 let raw = &flag["--patch-nop=".len()..];
                 let va = parse_hex_u64(raw)
@@ -1194,6 +1594,12 @@ fn parse_args_from<I: Iterator<Item = String>>(
                     .ok_or_else(|| format!("`--diff` requires a path\n{USAGE}"))?;
                 (diff, any_flag) = (Some(value), true);
             }
+            "--patch-from-diff" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("`--patch-from-diff` requires a path\n{USAGE}"))?;
+                (patch_from_diff, any_flag) = (Some(value), true);
+            }
             "-h" | "--help" => return Err(USAGE.to_string()),
             flag if flag.starts_with("--disasm=") => {
                 let count = flag["--disasm=".len()..]
@@ -1206,6 +1612,18 @@ fn parse_args_from<I: Iterator<Item = String>>(
                     .parse::<usize>()
                     .map_err(|_| format!("invalid function count in `{flag}`\n{USAGE}"))?;
                 (opts.listing, any_flag) = (Some(count), true);
+            }
+            flag if flag.starts_with("--objc=") => {
+                let count = flag["--objc=".len()..]
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid class count in `{flag}`\n{USAGE}"))?;
+                (opts.objc, any_flag) = (Some(count), true);
+            }
+            flag if flag.starts_with("--swift=") => {
+                let count = flag["--swift=".len()..]
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid type count in `{flag}`\n{USAGE}"))?;
+                (opts.swift, any_flag) = (Some(count), true);
             }
             flag if flag.starts_with("--lift=") => {
                 let count = flag["--lift=".len()..]
@@ -1255,9 +1673,28 @@ fn parse_args_from<I: Iterator<Item = String>>(
                     .map_err(|_| format!("invalid function count in `{flag}`\n{USAGE}"))?;
                 (opts.sigs, any_flag) = (Some(count), true);
             }
+            flag if flag.starts_with("--typefacts=") => {
+                let count = flag["--typefacts=".len()..]
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid function count in `{flag}`\n{USAGE}"))?;
+                (opts.typefacts, any_flag) = (Some(count), true);
+            }
+            flag if flag.starts_with("--flirt=") => {
+                let p = flag["--flirt=".len()..].to_string();
+                if p.is_empty() {
+                    return Err(format!("`--flirt=` requires a path\n{USAGE}"));
+                }
+                flirt_path = Some(p);
+                opts.flirt = true;
+                any_flag = true;
+            }
             flag if flag.starts_with("--db=") => db = Some(flag["--db=".len()..].to_string()),
             flag if flag.starts_with("--diff=") => {
                 (diff, any_flag) = (Some(flag["--diff=".len()..].to_string()), true);
+            }
+            flag if flag.starts_with("--patch-from-diff=") => {
+                (patch_from_diff, any_flag) =
+                    (Some(flag["--patch-from-diff=".len()..].to_string()), true);
             }
             flag if flag.starts_with('-') => {
                 return Err(format!("unknown option `{flag}`\n{USAGE}"));
@@ -1289,6 +1726,8 @@ fn parse_args_from<I: Iterator<Item = String>>(
             gotypes: false,
             devirt: false,
             gostrings: false,
+            objc: None,
+            swift: None,
             lift: None,
             simplify: false,
             ssa: None,
@@ -1298,12 +1737,15 @@ fn parse_args_from<I: Iterator<Item = String>>(
             stack: None,
             promote: None,
             sigs: None,
+            typefacts: None,
+            flirt: false,
             patch_nop: None,
             patch_apply: false,
+            json: false,
             all: true,
         };
     }
-    Ok((path, opts, db, diff))
+    Ok((path, opts, db, diff, patch_from_diff, flirt_path))
 }
 
 // ---------------------------------------------------------------------------
@@ -2742,6 +3184,8 @@ mod tests {
             gotypes: false,
             devirt: false,
             gostrings: false,
+            objc: None,
+            swift: None,
             lift: None,
             simplify: false,
             ssa: None,
@@ -2751,8 +3195,11 @@ mod tests {
             stack: None,
             promote: None,
             sigs: None,
+            typefacts: None,
+            flirt: false,
             patch_nop: None,
             patch_apply: false,
+            json: false,
             all: true,
         }
     }
@@ -2771,6 +3218,8 @@ mod tests {
             gotypes: false,
             devirt: false,
             gostrings: false,
+            objc: None,
+            swift: None,
             lift: None,
             simplify: false,
             ssa: None,
@@ -2780,8 +3229,11 @@ mod tests {
             stack: None,
             promote: None,
             sigs: None,
+            typefacts: None,
+            flirt: false,
             patch_nop: None,
             patch_apply: false,
+            json: false,
             all: false,
         }
     }
@@ -2829,7 +3281,7 @@ mod tests {
         db: Option<&annotate::Db>,
     ) -> Result<String, String> {
         let mut buf = Vec::new();
-        dump("test.bin", data, opts, db, &mut buf)?;
+        dump("test.bin", data, opts, db, None, &mut buf)?;
         Ok(String::from_utf8(buf).expect("dump output is UTF-8"))
     }
 
@@ -3910,16 +4362,26 @@ mod tests {
         // Most tests predate `--diff`; keep their 3-tuple shape and let
         // the diff-specific tests call `parse_args_from` directly.
         parse_args_from(args.iter().map(|s| s.to_string()))
-            .map(|(path, opts, db, _)| (path, opts, db))
+            .map(|(path, opts, db, _, _, _)| (path, opts, db))
     }
 
     fn parse_diff(args: &[&str]) -> Result<Option<String>, String> {
-        parse_args_from(args.iter().map(|s| s.to_string())).map(|(_, _, _, diff)| diff)
+        parse_args_from(args.iter().map(|s| s.to_string())).map(|(_, _, _, diff, _, _)| diff)
+    }
+
+    fn parse_patch_from_diff(args: &[&str]) -> Result<(Option<String>, bool), String> {
+        parse_args_from(args.iter().map(|s| s.to_string()))
+            .map(|(_, opts, _, _, p, _)| (p, opts.patch_apply))
+    }
+
+    fn parse_flirt(args: &[&str]) -> Result<(bool, Option<String>), String> {
+        parse_args_from(args.iter().map(|s| s.to_string()))
+            .map(|(_, opts, _, _, _, fp)| (opts.flirt, fp))
     }
 
     #[test]
     fn diff_flag_parses_both_spellings_and_is_a_selection() {
-        let (_, opts, _, diff) =
+        let (_, opts, _, diff, _, _) =
             parse_args_from(["a.exe", "--diff", "b.exe"].iter().map(|s| s.to_string())).unwrap();
         assert_eq!(diff.as_deref(), Some("b.exe"));
         // `--diff` selects its own output, so the default dump is off.
@@ -3932,6 +4394,28 @@ mod tests {
 
         let err = parse_diff(&["a.exe", "--diff"]).unwrap_err();
         assert!(err.contains("`--diff` requires a path"), "{err}");
+    }
+
+    #[test]
+    fn patch_from_diff_and_json_flags_parse() {
+        let (p, apply) =
+            parse_patch_from_diff(&["old.bin", "--patch-from-diff", "new.bin", "--patch-apply"])
+                .unwrap();
+        assert_eq!(p.as_deref(), Some("new.bin"));
+        assert!(apply);
+
+        let (_, opts, _, _, p2, _) = parse_args_from(
+            ["a.exe", "--patch-from-diff=b.exe"]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .unwrap();
+        assert_eq!(p2.as_deref(), Some("b.exe"));
+        assert!(!opts.all && !opts.headers);
+
+        let (_, opts, _) = parse(&["a.exe", "--json"]).unwrap();
+        assert!(opts.json);
+        assert!(!opts.all);
     }
 
     #[test]
@@ -4320,6 +4804,76 @@ mod tests {
     }
 
     #[test]
+    fn typefacts_flag_parses_with_and_without_a_count() {
+        let (_, opts, _) = parse(&["a.exe", "--typefacts"]).unwrap();
+        assert_eq!(opts.typefacts, Some(DEFAULT_LIFT_FUNCTIONS));
+        assert_eq!(opts.sigs, None, "--typefacts does not imply --sigs");
+
+        let (_, opts, _) = parse(&["a.exe", "--typefacts=2"]).unwrap();
+        assert_eq!(opts.typefacts, Some(2));
+
+        let err = parse(&["a.exe", "--typefacts=x"]).unwrap_err();
+        assert!(err.contains("invalid function count"), "{err}");
+    }
+
+    #[test]
+    fn flirt_flag_parses_with_and_without_a_path() {
+        let (on, path) = parse_flirt(&["a.exe", "--flirt"]).unwrap();
+        assert!(on);
+        assert_eq!(path, None);
+
+        let (on, path) = parse_flirt(&["a.exe", "--flirt=corpus.txt"]).unwrap();
+        assert!(on);
+        assert_eq!(path.as_deref(), Some("corpus.txt"));
+
+        let err = parse_flirt(&["a.exe", "--flirt="]).unwrap_err();
+        assert!(err.contains("requires a path"), "{err}");
+    }
+
+    #[test]
+    fn flirt_without_corpus_dumps_empty_note() {
+        let img = synthetic_elf64();
+        let out = dump_to_string(
+            &img,
+            Options {
+                flirt: true,
+                ..opts_none()
+            },
+        )
+        .unwrap();
+        assert!(out.contains("FLIRT"), "{out}");
+        assert!(out.contains("empty corpus"), "{out}");
+        assert!(out.contains("not IDA"), "{out}");
+    }
+
+    #[test]
+    fn flirt_with_corpus_path_loads_and_matches() {
+        let img = synthetic_elf64();
+        // Corpus that will not match the fixture — still proves load+match path.
+        let dir = std::env::temp_dir();
+        let corpus = dir.join("aletheia_flirt_test_corpus.txt");
+        std::fs::write(&corpus, "# test\ndeadbeef\tno_such_lib_fn\n").unwrap();
+        let mut buf = Vec::new();
+        dump(
+            "test.bin",
+            &img,
+            Options {
+                flirt: true,
+                ..opts_none()
+            },
+            None,
+            Some(corpus.to_str().unwrap()),
+            &mut buf,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&corpus);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("FLIRT"), "{out}");
+        assert!(out.contains("matches=0"), "{out}");
+        assert!(!out.contains("empty corpus"), "{out}");
+    }
+
+    #[test]
     fn promote_flag_parses_with_and_without_a_count() {
         let (_, opts, _) = parse(&["a.exe", "--promote"]).unwrap();
         assert_eq!(opts.promote, Some(DEFAULT_LIFT_FUNCTIONS));
@@ -4385,6 +4939,46 @@ mod tests {
         assert!(!text.contains("/* indirect jump"), "{text}");
         assert!(!text.contains("goto"), "{text}");
         assert_eq!(text, dump_to_string(&img, opts).unwrap());
+    }
+
+    #[test]
+    fn decompile_emits_sig_header_and_stack_local_names() {
+        // Frame that stores the first SysV arg (rdi) into a stack slot:
+        // live-in rdi → `sub_…(a)` header; affine SP address temps →
+        // `local_*` via irstack/mempromote namers.
+        let img = stack_arg_frame_elf64();
+        let opts = Options {
+            decompile: Some(4),
+            ..opts_none()
+        };
+        let text = dump_to_string(&img, opts).unwrap();
+        assert!(text.contains("PSEUDOCODE"), "{text}");
+        assert!(
+            text.contains("(a)") || text.contains("(a, "),
+            "sig header should spell at least one param:\n{text}"
+        );
+        assert!(
+            text.contains("local_"),
+            "--decompile should print local_* from stack slots:\n{text}"
+        );
+        assert_eq!(text, dump_to_string(&img, opts).unwrap());
+    }
+
+    /// `sub rsp, 0x20; mov [rsp], rdi; mov rax, [rsp]; add rsp, 0x20; ret`
+    fn stack_arg_frame_elf64() -> Vec<u8> {
+        let mut img = synthetic_elf64();
+        put(
+            &mut img,
+            ELF_TEXT_OFF,
+            &[
+                0x48, 0x83, 0xEC, 0x20, // sub rsp, 0x20
+                0x48, 0x89, 0x3C, 0x24, // mov [rsp], rdi
+                0x48, 0x8B, 0x04, 0x24, // mov rax, [rsp]
+                0x48, 0x83, 0xC4, 0x20, // add rsp, 0x20
+                0xC3, // ret
+            ],
+        );
+        img
     }
 
     #[test]
@@ -4860,6 +5454,80 @@ mod tests {
         .unwrap();
         assert!(text.contains("GO STRINGS"), "{text}");
         assert!(text.contains("no Go strings recovered"), "{text}");
+    }
+
+    #[test]
+    fn objc_flag_parses_with_and_without_a_count() {
+        let (_, opts, _) = parse(&["a.dylib", "--objc"]).unwrap();
+        assert_eq!(opts.objc, Some(DEFAULT_OBJC_CLASSES));
+        assert!(!opts.all && !opts.headers, "{opts:?}");
+
+        let (_, opts, _) = parse(&["a.dylib", "--objc=3"]).unwrap();
+        assert_eq!(opts.objc, Some(3));
+
+        let err = parse(&["a.dylib", "--objc=x"]).unwrap_err();
+        assert!(err.contains("invalid class count"), "{err}");
+
+        // Non-Mach-O: honest note, not a crash.
+        let img = synthetic_elf64();
+        let text = dump_to_string(
+            &img,
+            Options {
+                objc: Some(16),
+                ..opts_none()
+            },
+        )
+        .unwrap();
+        assert!(text.contains("OBJECTIVE-C CLASSES"), "{text}");
+        assert!(text.contains("not applicable"), "{text}");
+
+        // Mach-O without ObjC sections: empty recovery.
+        let text = dump_to_string(
+            &synthetic_macho64(),
+            Options {
+                objc: Some(16),
+                ..opts_none()
+            },
+        )
+        .unwrap();
+        assert!(text.contains("OBJECTIVE-C CLASSES"), "{text}");
+        assert!(text.contains("no ObjC classes recovered"), "{text}");
+    }
+
+    #[test]
+    fn swift_flag_parses_with_and_without_a_count() {
+        let (_, opts, _) = parse(&["a.dylib", "--swift"]).unwrap();
+        assert_eq!(opts.swift, Some(DEFAULT_SWIFT_TYPES));
+        assert!(!opts.all && !opts.headers, "{opts:?}");
+
+        let (_, opts, _) = parse(&["a.dylib", "--swift=3"]).unwrap();
+        assert_eq!(opts.swift, Some(3));
+
+        let err = parse(&["a.dylib", "--swift=x"]).unwrap_err();
+        assert!(err.contains("invalid type count"), "{err}");
+
+        let img = synthetic_elf64();
+        let text = dump_to_string(
+            &img,
+            Options {
+                swift: Some(16),
+                ..opts_none()
+            },
+        )
+        .unwrap();
+        assert!(text.contains("SWIFT METADATA"), "{text}");
+        assert!(text.contains("not applicable"), "{text}");
+
+        let text = dump_to_string(
+            &synthetic_macho64(),
+            Options {
+                swift: Some(16),
+                ..opts_none()
+            },
+        )
+        .unwrap();
+        assert!(text.contains("SWIFT METADATA"), "{text}");
+        assert!(text.contains("no __swift5_*"), "{text}");
     }
 
     #[test]

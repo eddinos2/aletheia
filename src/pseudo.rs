@@ -124,6 +124,19 @@ pub fn render(f: &SsaFunction, root: &Node, vars: &OutOfSsa) -> String {
 
 /// [`render`] with a [`VarNamer`] hook. Same contract.
 pub fn render_with(f: &SsaFunction, root: &Node, vars: &OutOfSsa, namer: VarNamer) -> String {
+    render_with_proto(f, root, vars, namer, None)
+}
+
+/// [`render_with`] plus an optional function prototype line
+/// (e.g. [`crate::sig::render_header`]'s `f(a, b)`). `None` keeps the
+/// default `{name}()` spelling.
+pub fn render_with_proto(
+    f: &SsaFunction,
+    root: &Node,
+    vars: &OutOfSsa,
+    namer: VarNamer,
+    prototype: Option<&str>,
+) -> String {
     let mut labels = BTreeSet::new();
     goto_targets(root, &mut labels, 0);
     let mut r = Renderer {
@@ -177,9 +190,12 @@ pub fn render_with(f: &SsaFunction, root: &Node, vars: &OutOfSsa, namer: VarName
         .name
         .clone()
         .unwrap_or_else(|| format!("sub_{:x}", f.entry));
+    let header = prototype
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| format!("{name}()"));
     let mut out = String::new();
     let _ = writeln!(out, "// {name} @ {:#018x} (pseudo)", f.entry);
-    let _ = writeln!(out, "{name}() {{");
+    let _ = writeln!(out, "{header} {{");
     if !f.live_in.is_empty() {
         let list = f
             .live_in
@@ -2657,5 +2673,21 @@ mod tests {
         let t = render_with(&ssa, &root, &vars, &|v| Some(format!("local_{v}")));
         assert!(t.contains("local_"), "{t}");
         assert!(!code_lines(&t).iter().any(|l| l.contains(" v0 ")), "{t}");
+    }
+
+    #[test]
+    fn render_with_proto_spells_the_provided_header() {
+        let f = func(
+            0x1000,
+            vec![block(
+                0x1000,
+                vec![assign(ra(0, Width::W64), c(1, Width::W64)), ret()],
+                vec![],
+            )],
+        );
+        let (ssa, root, vars) = pipe(&f);
+        let t = render_with_proto(&ssa, &root, &vars, &|_| None, Some("add(a, b)"));
+        assert!(t.contains("add(a, b) {"), "{t}");
+        assert!(!t.contains("sub_1000() {"), "{t}");
     }
 }

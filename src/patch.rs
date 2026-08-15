@@ -302,6 +302,46 @@ pub fn hunks_from_modified(
     modified_hunks(old, new, &pairs, cap)
 }
 
+/// Default prefix window (bytes) when turning Modified pairs into hunks /
+/// a PatchSet for CLI / MCP.
+pub const DEFAULT_HUNK_CAP: usize = 32;
+
+/// Build a same-length [`PatchSet`] from [`DiffHunk`]s against `target_bytes`
+/// (the *old* image). Each hunk contributes one edit at `old_va` over the
+/// overlapping prefix (`min(old,new)`); identical windows are skipped.
+pub fn patchset_from_hunks(target_bytes: &[u8], hunks: &[DiffHunk]) -> PatchSet {
+    let mut edits = Vec::new();
+    for h in hunks {
+        let n = h.old_prefix.len().min(h.new_prefix.len());
+        if n == 0 {
+            continue;
+        }
+        let old = &h.old_prefix[..n];
+        let new = &h.new_prefix[..n];
+        if old == new {
+            continue;
+        }
+        edits.push(PatchEdit {
+            va: h.old_va,
+            old_bytes: old.to_vec(),
+            new_bytes: new.to_vec(),
+            intent: format!("diff-hunk old={:#x} new={:#x}", h.old_va, h.new_va),
+        });
+    }
+    PatchSet::new(target_bytes, edits)
+}
+
+/// Diff → [`hunks_from_modified`] → [`patchset_from_hunks`] for the old image.
+pub fn patchset_from_modified(
+    old: &dyn Image,
+    new: &dyn Image,
+    diff: &crate::diff::Diff,
+    cap: usize,
+) -> PatchSet {
+    let hunks = hunks_from_modified(old, new, diff, cap);
+    patchset_from_hunks(old.bytes(), &hunks)
+}
+
 /// Stable ordering helper for tests.
 pub fn edits_by_va(set: &PatchSet) -> BTreeMap<u64, &PatchEdit> {
     set.edits.iter().map(|e| (e.va, e)).collect()
@@ -464,5 +504,43 @@ mod tests {
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].old_prefix, MOV_1);
         assert_eq!(hunks[0].new_prefix, MOV_2);
+
+        let set = patchset_from_modified(old_image.as_ref(), new_image.as_ref(), &d, 6);
+        assert_eq!(set.edits.len(), 1);
+        assert_eq!(set.edits[0].old_bytes, MOV_1);
+        assert_eq!(set.edits[0].new_bytes, MOV_2);
+        assert!(set.preview(old_image.as_ref()).is_ok());
+    }
+
+    #[test]
+    fn patchset_from_hunks_skips_identical_and_empty() {
+        let bytes = vec![0u8; 8];
+        let set = patchset_from_hunks(
+            &bytes,
+            &[
+                DiffHunk {
+                    old_va: 0,
+                    new_va: 0,
+                    old_prefix: vec![1, 2],
+                    new_prefix: vec![1, 2],
+                },
+                DiffHunk {
+                    old_va: 4,
+                    new_va: 4,
+                    old_prefix: vec![],
+                    new_prefix: vec![9],
+                },
+                DiffHunk {
+                    old_va: 2,
+                    new_va: 2,
+                    old_prefix: vec![0, 0, 0],
+                    new_prefix: vec![0xaa, 0xbb],
+                },
+            ],
+        );
+        assert_eq!(set.edits.len(), 1);
+        assert_eq!(set.edits[0].va, 2);
+        assert_eq!(set.edits[0].old_bytes, vec![0, 0]);
+        assert_eq!(set.edits[0].new_bytes, vec![0xaa, 0xbb]);
     }
 }

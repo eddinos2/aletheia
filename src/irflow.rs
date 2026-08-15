@@ -1463,7 +1463,11 @@ fn expr_nodes_capped(e: &Expr) -> bool {
 /// loads outright and resolution refuses load-bearing definitions), so a
 /// matcher's load gate on the kept operand covers the dropped duplicate:
 /// either the two are byte-identical, or both are load-free.
-fn veq(a: &Expr, b: &Expr, vn: Option<&VnDefs>) -> bool {
+/// Whether `a` and `b` are the same value under `vn` — structural
+/// equality, or the same canonical key through pure defs. `None` for
+/// `vn` is exactly structural equality. Used by pair-fold matchers and
+/// by [`crate::irstruct`]'s congruent-condition fold.
+pub(crate) fn veq(a: &Expr, b: &Expr, vn: Option<&VnDefs>) -> bool {
     if a == b {
         return true;
     }

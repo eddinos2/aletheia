@@ -47,9 +47,10 @@
 //! - **Element moves**: `DUP` (general, element→vector, and the scalar
 //!   `mov d0, v1.d[1]` form), `INS` (general and element),
 //!   `UMOV`/`SMOV`.
-//! - **Advanced SIMD three-same integer ALU**: `ADD`/`SUB`/`AND`/`ORR`/
-//!   `EOR` vector forms (byte through double for ADD/SUB; the logical
-//!   trio always on `.8b`/`.16b`).
+//! - **Advanced SIMD three-same ALU**: integer `ADD`/`SUB`/`AND`/`ORR`/
+//!   `EOR`, vector `FADD`/`FMUL`, and `CMEQ`/`CMHI` (byte through
+//!   double for integer ADD/SUB/compares; logical trio always on
+//!   `.8b`/`.16b`; FADD/FMUL on `.2s`/`.4s`/`.2d`).
 //! - **Exclusives / ordered**: `LDAR`/`STLR`, `LDXR`/`LDAXR`,
 //!   `STXR`/`STLXR`, every size.
 //! - **Pointer authentication and UDF**: `RETAA`/`RETAB`, the
@@ -66,7 +67,7 @@
 //!
 //! Known gaps (all decode as `Unknown` / `Sequential`): the remaining
 //! Advanced SIMD vector ALU (two-reg-misc, shift-immediate, across-lanes,
-//! permutes, compares, the BIC/ORN/BSL siblings), the structure
+//! permutes, the BIC/ORN/BSL siblings), the structure
 //! loads/stores (`LD1`/`ST1`/...), LSE atomics (`LDADD`/`SWP`/`CAS`...),
 //! the D-key PAC data ops, `ERET`/`DRPS`, half precision, `PRFM`, the
 //! unprivileged `LDTR`/`STTR` forms, fixed-point converts (`FCVTZS` with
@@ -291,9 +292,10 @@ impl F2Op {
     }
 }
 
-/// Advanced SIMD three-same integer ALU (the public ADD/SUB/AND/ORR/EOR
-/// vector forms). Element size is log2 bytes for ADD/SUB; the logical
-/// trio always operates on bytes (`.8b`/`.16b` by `Q`).
+/// Advanced SIMD three-same ALU (public integer ADD/SUB/AND/ORR/EOR,
+/// vector FADD/FMUL, and compares CMEQ/CMHI). Element size is log2
+/// bytes for integer ADD/SUB/compares; the logical trio always operates
+/// on bytes (`.8b`/`.16b` by `Q`); FADD/FMUL use size 2 (S) or 3 (D).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimdAluOp {
     Add,
@@ -301,6 +303,10 @@ pub enum SimdAluOp {
     And,
     Orr,
     Eor,
+    Fadd,
+    Fmul,
+    Cmeq,
+    Cmhi,
 }
 
 impl SimdAluOp {
@@ -312,6 +318,10 @@ impl SimdAluOp {
             SimdAluOp::And => "and",
             SimdAluOp::Orr => "orr",
             SimdAluOp::Eor => "eor",
+            SimdAluOp::Fadd => "fadd",
+            SimdAluOp::Fmul => "fmul",
+            SimdAluOp::Cmeq => "cmeq",
+            SimdAluOp::Cmhi => "cmhi",
         }
     }
 }
@@ -1035,10 +1045,10 @@ pub enum Opcode {
         rd: u8,
         rn: u8,
     },
-    /// Advanced SIMD three-same integer ALU: `ADD`/`SUB`/`AND`/`ORR`/`EOR`
-    /// vector forms. `size` is the element log2 width for ADD/SUB; the
-    /// logical ops ignore it (always byte lanes). `q` selects 64- vs
-    /// 128-bit vectors.
+    /// Advanced SIMD three-same ALU: integer `ADD`/`SUB`/`AND`/`ORR`/`EOR`,
+    /// vector `FADD`/`FMUL`, and `CMEQ`/`CMHI`. `size` is the element
+    /// log2 width (2/3 for FADD/FMUL S/D); logical ops ignore it
+    /// (always byte lanes). `q` selects 64- vs 128-bit vectors.
     SimdAlu {
         op: SimdAluOp,
         q: bool,
@@ -2403,9 +2413,10 @@ fn decode_simd_fp(w: u32) -> Opcode {
             _ => Opcode::Unknown(w),
         };
     }
-    // Advanced SIMD three-same integer ALU (public Arm ARM encodings):
-    // 0 Q U 01110 size 1 Rm opcode 1 Rn Rd — ADD/SUB (opcode 10000) and
-    // AND/ORR/EOR (opcode 00011; size discriminates the logical op).
+    // Advanced SIMD three-same (public Arm ARM encodings):
+    // 0 Q U 01110 size 1 Rm opcode 1 Rn Rd — integer ADD/SUB (10000),
+    // AND/ORR/EOR (00011), CMEQ (10001)/CMHI (00110), and FP
+    // FADD (11010)/FMUL (11011; U selects the FP op).
     if w & 0x9F20_0400 == 0x0E20_0400 {
         let q = bit(w, 30);
         let u = bit(w, 29);
@@ -2419,10 +2430,20 @@ fn decode_simd_fp(w: u32) -> Opcode {
             (false, 0b00, 0b00011) => SimdAluOp::And,
             (false, 0b10, 0b00011) => SimdAluOp::Orr,
             (true, 0b00, 0b00011) => SimdAluOp::Eor,
+            // CMEQ / CMHI (integer); .2d requires Q = 1.
+            (true, _, 0b10001) if size < 3 || q => SimdAluOp::Cmeq,
+            (true, _, 0b00110) if size < 3 || q => SimdAluOp::Cmhi,
+            // FADD / FMUL: encoding size 0 = S, 1 = D (Q = 1 for .2d).
+            (false, 0b00, 0b11010) => SimdAluOp::Fadd,
+            (false, 0b01, 0b11010) if q => SimdAluOp::Fadd,
+            (true, 0b00, 0b11011) => SimdAluOp::Fmul,
+            (true, 0b01, 0b11011) if q => SimdAluOp::Fmul,
             _ => return Opcode::Unknown(w),
         };
         let elem = match op {
             SimdAluOp::And | SimdAluOp::Orr | SimdAluOp::Eor => 0,
+            // FP encoding size → arrangement log2 width (S = 2, D = 3).
+            SimdAluOp::Fadd | SimdAluOp::Fmul => 2 + size,
             _ => size,
         };
         return Opcode::SimdAlu {
@@ -5523,6 +5544,48 @@ mod tests {
         assert_eq!(ins(0x0EE2_8420, VA).opcode, Opcode::Unknown(0x0EE2_8420));
         // BIC (size=01 logical) stays Unknown this slice.
         assert_eq!(ins(0x4E61_1C21, VA).opcode, Opcode::Unknown(0x4E61_1C21));
+    }
+
+    #[test]
+    fn simd_three_same_fp_and_compare_decodes() {
+        // fadd v0.4s, v1.4s, v2.4s
+        assert_eq!(
+            ins(0x4E22_D420, VA).opcode,
+            Opcode::SimdAlu {
+                op: SimdAluOp::Fadd,
+                q: true,
+                size: 2,
+                rd: 0,
+                rn: 1,
+                rm: 2
+            }
+        );
+        assert_eq!(ins(0x4E22_D420, VA).to_string(), "fadd v0.4s, v1.4s, v2.4s");
+        // fadd v0.2d, v1.2d, v2.2d
+        assert_eq!(ins(0x4E62_D420, VA).to_string(), "fadd v0.2d, v1.2d, v2.2d");
+        // fmul v0.4s, v1.4s, v2.4s
+        assert_eq!(ins(0x6E22_DC20, VA).to_string(), "fmul v0.4s, v1.4s, v2.4s");
+        // fmul v0.2d, v1.2d, v2.2d
+        assert_eq!(ins(0x6E62_DC20, VA).to_string(), "fmul v0.2d, v1.2d, v2.2d");
+        // fadd v0.2s, v1.2s, v2.2s (Q = 0)
+        assert_eq!(ins(0x0E22_D420, VA).to_string(), "fadd v0.2s, v1.2s, v2.2s");
+        // cmhi v0.4s, v1.4s, v2.4s
+        assert_eq!(
+            ins(0x6EA2_3420, VA).opcode,
+            Opcode::SimdAlu {
+                op: SimdAluOp::Cmhi,
+                q: true,
+                size: 2,
+                rd: 0,
+                rn: 1,
+                rm: 2
+            }
+        );
+        assert_eq!(ins(0x6EA2_3420, VA).to_string(), "cmhi v0.4s, v1.4s, v2.4s");
+        // cmeq v0.16b, v1.16b, v2.16b
+        assert_eq!(ins(0x6E22_8C20, VA).to_string(), "cmeq v0.16b, v1.16b, v2.16b");
+        // .2d FADD with Q = 0 is reserved → Unknown.
+        assert_eq!(ins(0x0E62_D420, VA).opcode, Opcode::Unknown(0x0E62_D420));
     }
 
     // Every FP-arithmetic golden word below was produced by assembling

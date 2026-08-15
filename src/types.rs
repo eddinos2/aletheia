@@ -1,8 +1,9 @@
-//! Lightweight type vocabulary stub (pre-`irtype`).
+//! Lightweight type vocabulary shared with [`crate::irtype`].
 //!
-//! Holds placeholder [`TypeId`]s and coarse [`TypeKind`]s so later slices
-//! can attach recovered parameter types from [`crate::sig`] without
-//! inventing a full constraint solver yet. Minimal and total.
+//! Holds [`TypeId`]s and coarse [`TypeKind`]s so callee-side signatures
+//! ([`crate::sig`]) can attach placeholder parameter types; [`crate::irtype`]
+//! then refines those ids from SSA evidence. Minimal and total — no
+//! constraint solver here.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -157,9 +158,9 @@ impl ParamTypeMap {
 
 /// Attach placeholder integer types from callee-side signature widths.
 ///
-/// Later `irtype` evidence can refine these ids in place; for now each
-/// param becomes `Int { width, signed: None }` and the first return cell
-/// (if any) the same.
+/// Each param becomes `Int { width, signed: None }` and the first return
+/// cell (if any) the same. Call [`crate::irtype::attach_sig_with_evidence`]
+/// to refine ids from SSA usage facts without replacing this entry point.
 pub fn attach_sig_params(sig: &Signature, table: &mut TypeTable) -> ParamTypeMap {
     let mut params = Vec::new();
     for (i, p) in sig.params.iter().enumerate() {

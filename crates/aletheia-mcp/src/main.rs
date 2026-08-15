@@ -4,9 +4,14 @@
 //!   {"id":1,"method":"health","params":{}}
 //!   {"id":2,"method":"open","params":{"path":"/bin/ls"}}
 //!   {"id":3,"method":"functions","params":{"session":"s1","limit":32}}
-//!   {"id":4,"method":"decompile","params":{"session":"s1","entry":"0x1000"}}
-//!   {"id":5,"method":"diff","params":{"session_a":"s1","session_b":"s2"}}
-//!   {"id":6,"method":"patch_preview","params":{"session":"s1","va":"0x1000"}}
+//!   {"id":4,"method":"listing","params":{"session":"s1","entry":"0x1000"}}
+//!   {"id":5,"method":"decompile","params":{"session":"s1","entry":"0x1000"}}
+//!   {"id":6,"method":"stack","params":{"session":"s1","entry":"0x1000"}}
+//!   {"id":7,"method":"xrefs","params":{"session":"s1","va":"0x1000"}}
+//!   {"id":8,"method":"rename","params":{"session":"s1","va":"0x1000","name":"foo"}}
+//!   {"id":9,"method":"diff","params":{"session_a":"s1","session_b":"s2"}}
+//!   {"id":10,"method":"patch_preview","params":{"session":"s1","va":"0x1000"}}
+//!   {"id":11,"method":"patch_apply","params":{"session":"s1","va":"0x1000"}}
 //!
 //! Designed so `health` never blocks on analysis (jobs tracked via `busy_jobs`).
 //! Full MCP SDK wiring can wrap this without changing the engine.
@@ -16,9 +21,11 @@ use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use aletheia::annotate;
 use aletheia::patch::{self, fnv1a64};
 use aletheia::{
-    callfx, cfg, diff, funcs, irlift, irout, irssa, irssaopt, irstruct, jumptable, pseudo,
+    anchor, callfx, cfg, diff, funcs, irlift, irout, irssa, irssaopt, irstruct, irstack, jumptable,
+    listing, mempromote, pseudo, sig, xref,
 };
 
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -29,12 +36,13 @@ struct Session {
     path: String,
     data: Vec<u8>,
     hash: u64,
+    db: annotate::Db,
 }
 
 struct State {
     sessions: BTreeMap<String, Session>,
     next_id: AtomicU64,
-    /// In-flight long tools (`decompile`, `diff`, `functions`, `patch_preview`).
+    /// In-flight long tools.
     busy: AtomicU64,
 }
 
@@ -66,9 +74,14 @@ fn handle_line(state: &Arc<Mutex<State>>, line: &str) -> String {
         "health" => health(state, id),
         "open" => open(state, id, line),
         "functions" => with_busy(state, id, || functions(state, id, line)),
+        "listing" => with_busy(state, id, || listing_method(state, id, line)),
         "decompile" => with_busy(state, id, || decompile(state, id, line)),
+        "stack" => with_busy(state, id, || stack_method(state, id, line)),
+        "xrefs" => with_busy(state, id, || xrefs_method(state, id, line)),
+        "rename" => rename_method(state, id, line),
         "diff" => with_busy(state, id, || diff_sessions(state, id, line)),
         "patch_preview" => with_busy(state, id, || patch_preview(state, id, line)),
+        "patch_apply" => with_busy(state, id, || patch_apply(state, id, line)),
         "why" => why(id, line),
         "cancel" => cancel(state, id),
         _ => json_err(id, &format!("unknown method `{method}`")),
@@ -97,6 +110,9 @@ fn open(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
             let arch = aletheia::load(&data)
                 .map(|i| format!("{:?}", i.arch()))
                 .unwrap_or_else(|_| "unknown".into());
+            let encrypted = aletheia::macho::MachFile::parse(&data)
+                .map(|m| m.is_encrypted())
+                .unwrap_or(false);
             let sid = {
                 let mut st = state.lock().unwrap();
                 let n = st.next_id.fetch_add(1, Ordering::Relaxed);
@@ -107,6 +123,7 @@ fn open(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
                         path: path.clone(),
                         data,
                         hash,
+                        db: annotate::Db::new(),
                     },
                 );
                 sid
@@ -114,7 +131,7 @@ fn open(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
             json_ok(
                 id,
                 &format!(
-                    r#"{{"session_id":"{sid}","path":{path_json},"arch":"{arch}","hash":"0x{hash:x}","stamp":{stamp}}}"#,
+                    r#"{{"session_id":"{sid}","path":{path_json},"arch":"{arch}","hash":"0x{hash:x}","encrypted":{encrypted},"stamp":{stamp}}}"#,
                     path_json = json_string(&path),
                     stamp = stamp_hash(hash),
                 ),
@@ -176,6 +193,51 @@ fn functions(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
     )
 }
 
+fn listing_method(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
+    let session = match session_id(line) {
+        Some(s) => s,
+        None => return json_err(id, "listing requires session"),
+    };
+    let entry = extract_string(line, "\"entry\"")
+        .and_then(|s| parse_hex(&s))
+        .or_else(|| extract_number(line, "\"entry\""));
+    let Some(entry) = entry else {
+        return json_err(id, "listing requires params.entry");
+    };
+    let max_lines = extract_number(line, "\"max_insns\"")
+        .or_else(|| extract_number(line, "\"max_lines\""))
+        .unwrap_or(65_536) as usize;
+
+    let result = (|| {
+        let st = state.lock().unwrap();
+        let sess = st
+            .sessions
+            .get(&session)
+            .ok_or_else(|| "unknown session".to_string())?;
+        let image = aletheia::load(&sess.data).map_err(|e| e.to_string())?;
+        let program = cfg::recover(image.as_ref()).map_err(|e| e.to_string())?;
+        let opts = listing::Options {
+            max_functions: 1,
+            max_lines,
+            ..listing::Options::default()
+        };
+        let text = listing::render_function(image.as_ref(), &program, entry, Some(&sess.db), &opts);
+        Ok::<_, String>((text, sess.hash))
+    })();
+
+    match result {
+        Ok((text, hash)) => json_ok(
+            id,
+            &format!(
+                r#"{{"session_id":"{session}","entry":"0x{entry:x}","listing":"{escaped}","stamp":{stamp}}}"#,
+                escaped = escape_json(&text),
+                stamp = stamp_hash(hash),
+            ),
+        ),
+        Err(e) => json_err(id, &e),
+    }
+}
+
 fn decompile(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
     let session = match session_id(line) {
         Some(s) => s,
@@ -214,9 +276,16 @@ fn decompile(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
         let (fwd, _) = irssaopt::forward(&opt);
         let live_out = callfx::function_live_out(image.arch()).unwrap_or_default();
         let (swept, _) = irssaopt::eliminate_dead(&fwd, &live_out);
+        let stack = irstack::analyze(&swept);
+        let promote = mempromote::promote(&swept, &stack);
+        let swept = mempromote::apply(&swept, &promote);
+        let signature = sig::recover(&swept);
         let (root, _) = irstruct::structure(&swept, &tables);
         let (vars, _) = irout::out_of_ssa(&swept);
-        let text = pseudo::render(&swept, &root, &vars);
+        let names = mempromote::var_namer(&swept, &stack, &promote, &vars.var_of);
+        let namer = |v: u32| names.get(&v).cloned();
+        let header = signature.render_header();
+        let text = pseudo::render_with_proto(&swept, &root, &vars, &namer, Some(&header));
         let hash = sess.hash;
         let entry_va = func.entry;
         Ok::<_, String>((text, hash, entry_va))
@@ -227,6 +296,189 @@ fn decompile(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
             &format!(
                 r#"{{"session_id":"{session}","entry":"0x{entry_va:x}","pseudocode":"{escaped}","stamp":{stamp}}}"#,
                 escaped = escape_json(&text),
+                stamp = stamp_hash(hash),
+            ),
+        ),
+        Err(e) => json_err(id, &e),
+    }
+}
+
+fn stack_method(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
+    let session = match session_id(line) {
+        Some(s) => s,
+        None => return json_err(id, "stack requires session"),
+    };
+    let entry = extract_string(line, "\"entry\"")
+        .and_then(|s| parse_hex(&s))
+        .or_else(|| extract_number(line, "\"entry\""));
+    let Some(entry) = entry else {
+        return json_err(id, "stack requires params.entry");
+    };
+
+    let result = (|| {
+        let st = state.lock().unwrap();
+        let sess = st
+            .sessions
+            .get(&session)
+            .ok_or_else(|| "unknown session".to_string())?;
+        let image = aletheia::load(&sess.data).map_err(|e| e.to_string())?;
+        let folded = jumptable::resolve_folded(image.as_ref()).map_err(|e| e.to_string())?;
+        let func = folded
+            .program
+            .functions
+            .get(&entry)
+            .ok_or_else(|| format!("no function at {entry:#x}"))?;
+        let lifted = irlift::lift_function(image.as_ref(), func)
+            .ok_or_else(|| "lift failed".to_string())?;
+        let lifted = match callfx::abi_for(image.arch()) {
+            Some(abi) => callfx::apply(&lifted, &abi),
+            None => lifted,
+        };
+        let ssa = irssa::construct(&lifted).map_err(|e| e.to_string())?;
+        let (opt, _) = irssaopt::optimize(&ssa);
+        let (fwd, _) = irssaopt::forward(&opt);
+        let live_out = callfx::function_live_out(image.arch()).unwrap_or_default();
+        let (swept, _) = irssaopt::eliminate_dead(&fwd, &live_out);
+        let facts = irstack::analyze(&swept);
+        let text = facts.render();
+        Ok::<_, String>((text, sess.hash))
+    })();
+
+    match result {
+        Ok((text, hash)) => json_ok(
+            id,
+            &format!(
+                r#"{{"session_id":"{session}","entry":"0x{entry:x}","stack":"{escaped}","stamp":{stamp}}}"#,
+                escaped = escape_json(&text),
+                stamp = stamp_hash(hash),
+            ),
+        ),
+        Err(e) => json_err(id, &e),
+    }
+}
+
+fn xrefs_method(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
+    let session = match session_id(line) {
+        Some(s) => s,
+        None => return json_err(id, "xrefs requires session"),
+    };
+    let va = extract_string(line, "\"va\"")
+        .and_then(|s| parse_hex(&s))
+        .or_else(|| extract_number(line, "\"va\""));
+    let Some(va) = va else {
+        return json_err(id, "xrefs requires params.va");
+    };
+
+    let result = (|| {
+        let st = state.lock().unwrap();
+        let sess = st
+            .sessions
+            .get(&session)
+            .ok_or_else(|| "unknown session".to_string())?;
+        let image = aletheia::load(&sess.data).map_err(|e| e.to_string())?;
+        let program = cfg::recover(image.as_ref()).map_err(|e| e.to_string())?;
+        let xrefs = xref::compute(image.as_ref(), &program).map_err(|e| e.to_string())?;
+        let from_json: Vec<String> = xrefs
+            .refs_from(va)
+            .iter()
+            .map(|x| {
+                let label = xrefs
+                    .to_label(x)
+                    .map(|s| format!(r#""{}""#, escape_json(s)))
+                    .unwrap_or_else(|| "null".into());
+                format!(
+                    r#"{{"from":"0x{:x}","to":"0x{:x}","kind":"{}","label":{label}}}"#,
+                    x.from,
+                    x.to,
+                    x.kind.as_str(),
+                )
+            })
+            .collect();
+        let to_json: Vec<String> = xrefs
+            .refs_to(va)
+            .iter()
+            .map(|x| {
+                let label = xrefs
+                    .to_label(x)
+                    .map(|s| format!(r#""{}""#, escape_json(s)))
+                    .unwrap_or_else(|| "null".into());
+                format!(
+                    r#"{{"from":"0x{:x}","to":"0x{:x}","kind":"{}","label":{label}}}"#,
+                    x.from,
+                    x.to,
+                    x.kind.as_str(),
+                )
+            })
+            .collect();
+        Ok::<_, String>((from_json, to_json, sess.hash, xrefs.len()))
+    })();
+
+    match result {
+        Ok((from_json, to_json, hash, total)) => json_ok(
+            id,
+            &format!(
+                r#"{{"session_id":"{session}","va":"0x{va:x}","from":[{from}],"to":[{to}],"total":{total},"stamp":{stamp}}}"#,
+                from = from_json.join(","),
+                to = to_json.join(","),
+                stamp = stamp_hash(hash),
+            ),
+        ),
+        Err(e) => json_err(id, &e),
+    }
+}
+
+fn rename_method(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
+    let session = match session_id(line) {
+        Some(s) => s,
+        None => return json_err(id, "rename requires session"),
+    };
+    let va = extract_string(line, "\"va\"")
+        .and_then(|s| parse_hex(&s))
+        .or_else(|| extract_string(line, "\"anchor\"").and_then(|s| parse_hex(&s)))
+        .or_else(|| extract_number(line, "\"va\""));
+    let Some(va) = va else {
+        return json_err(id, "rename requires params.va (or anchor as hex VA)");
+    };
+    let Some(name) = extract_string(line, "\"name\"") else {
+        return json_err(id, "rename requires params.name");
+    };
+
+    let result = (|| {
+        let mut st = state.lock().unwrap();
+        let sess = st
+            .sessions
+            .get_mut(&session)
+            .ok_or_else(|| "unknown session".to_string())?;
+        let image = aletheia::load(&sess.data).map_err(|e| e.to_string())?;
+        let program = cfg::recover(image.as_ref()).map_err(|e| e.to_string())?;
+        let func = program
+            .functions
+            .get(&va)
+            .ok_or_else(|| format!("no function at {va:#x}"))?;
+        let target = anchor::of_function(image.as_ref(), func);
+        sess.db.set_name(target, &name);
+        let tip = sess
+            .db
+            .log()
+            .last()
+            .map(|a| {
+                format!(
+                    r#"{{"seq":{},"id":"0x{:x}","field":"name","va":"0x{va:x}","name":"{}"}}"#,
+                    a.seq,
+                    a.id,
+                    escape_json(&name),
+                )
+            })
+            .unwrap_or_else(|| "null".into());
+        let hash = sess.hash;
+        Ok::<_, String>((tip, hash))
+    })();
+
+    match result {
+        Ok((tip, hash)) => json_ok(
+            id,
+            &format!(
+                r#"{{"session_id":"{session}","tip":{tip},"stamp":{stamp}}}"#,
                 stamp = stamp_hash(hash),
             ),
         ),
@@ -376,6 +628,64 @@ fn patch_preview(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
     }
 }
 
+fn patch_apply(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
+    let session = match session_id(line) {
+        Some(s) => s,
+        None => return json_err(id, "patch_apply requires session"),
+    };
+    let va = extract_string(line, "\"va\"")
+        .and_then(|s| parse_hex(&s))
+        .or_else(|| extract_number(line, "\"va\""));
+    let Some(va) = va else {
+        return json_err(id, "patch_apply requires params.va (NOP apply)");
+    };
+    let intent = extract_string(line, "\"intent\"").unwrap_or_else(|| "mcp patch_apply".into());
+
+    let result = (|| {
+        let st = state.lock().unwrap();
+        let sess = st
+            .sessions
+            .get(&session)
+            .ok_or_else(|| "unknown session".to_string())?;
+        let image = aletheia::load(&sess.data).map_err(|e| e.to_string())?;
+        let off = image
+            .va_to_offset(va)
+            .ok_or_else(|| format!("VA {va:#x} unmapped"))?;
+        let bytes = image.bytes();
+        let len = if matches!(image.arch(), aletheia::Arch::Aarch64) {
+            4
+        } else {
+            1
+        };
+        if off + len > bytes.len() {
+            return Err(format!("VA {va:#x} past end of file"));
+        }
+        let old = bytes[off..off + len].to_vec();
+        let mut set = patch::nop_patch(image.as_ref(), va, &old, &intent)
+            .map_err(|e| e.to_string())?;
+        if sess.path.contains(".app/") || sess.path.ends_with(".dylib") || looks_macho(&sess.data)
+        {
+            set = set.with_macho_resign_recipe(&sess.path);
+        }
+        let out_path = set
+            .apply_sibling(image.as_ref(), std::path::Path::new(&sess.path))
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>((out_path.display().to_string(), sess.hash, set.target_hash))
+    })();
+
+    match result {
+        Ok((out_path, hash, target_hash)) => json_ok(
+            id,
+            &format!(
+                r#"{{"session_id":"{session}","va":"0x{va:x}","path":{path_json},"target_hash":"0x{target_hash:x}","stamp":{stamp}}}"#,
+                path_json = json_string(&out_path),
+                stamp = stamp_hash(hash),
+            ),
+        ),
+        Err(e) => json_err(id, &e),
+    }
+}
+
 fn why(id: u64, line: &str) -> String {
     let session = session_id(line);
     let fact = extract_string(line, "\"fact_id\"").unwrap_or_default();
@@ -410,7 +720,6 @@ fn with_busy(state: &Arc<Mutex<State>>, id: u64, f: impl FnOnce() -> String) -> 
     state.lock().unwrap().busy.fetch_add(1, Ordering::Relaxed);
     let reply = f();
     state.lock().unwrap().busy.fetch_sub(1, Ordering::Relaxed);
-    // Ensure envelope still carries the request id if the closure forgot.
     let _ = id;
     reply
 }

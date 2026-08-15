@@ -242,11 +242,7 @@ pub fn analyze(f: &SsaFunction) -> StackFacts {
     }
 }
 
-/// Build a [`crate::pseudo::VarNamer`] closure mapping SSA var ids
-/// (out-of-SSA) is separate — this maps **stack offsets** to names via
-/// a lookup from SSA name id when that name is a proven stack address
-/// temporary. For the first landing we expose slot labels by offset
-/// for dumps; decompile wiring uses [`slot_label`].
+/// Label for the evidence-backed slot covering `offset`, if any.
 pub fn slot_label(facts: &StackFacts, offset: i64) -> Option<String> {
     facts
         .slots
@@ -255,11 +251,24 @@ pub fn slot_label(facts: &StackFacts, offset: i64) -> Option<String> {
         .map(|s| format!("local_{}", s.base.unsigned_abs()))
 }
 
-/// Namer for out-of-SSA variable ids: if the underlying SSA name's cell
-/// is never needed — instead, when rendering loads of stack slots the
-/// caller can rewrite. Here we provide a helper that names an SSA name
-/// id when that name is Affine (the address itself), returning
-/// `local_<abs>` for the offset.
+/// Map SSA name ids that are proven addresses of evidence-backed slots
+/// to their `local_N` labels. Callers fold through
+/// [`crate::irout::OutOfSsa::var_of`] (or [`crate::mempromote::var_namer`])
+/// to feed [`crate::pseudo`]'s [`crate::pseudo::VarNamer`] hook.
+pub fn slot_namer(facts: &StackFacts) -> BTreeMap<u16, String> {
+    let mut map = BTreeMap::new();
+    for (&id, fact) in &facts.name_facts {
+        if let SpFact::Affine(c) = *fact
+            && let Some(label) = slot_label(facts, c)
+        {
+            map.insert(id, label);
+        }
+    }
+    map
+}
+
+/// Name an SSA name id when that name is Affine (the address itself),
+/// returning `local_<abs>` for a covering slot, else `sp0±c`.
 pub fn name_affine_local(facts: &StackFacts, ssa_name_id: u16) -> Option<String> {
     match facts.name_facts.get(&ssa_name_id)? {
         SpFact::Affine(c) => slot_label(facts, *c).or_else(|| Some(format!("sp0{c:+}"))),
@@ -568,6 +577,8 @@ mod tests {
             name_affine_local(&facts, 1).as_deref(),
             Some("local_32")
         );
+        let named = slot_namer(&facts);
+        assert_eq!(named.get(&1).map(String::as_str), Some("local_32"));
     }
 
     #[test]

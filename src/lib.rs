@@ -9,6 +9,9 @@
 //! - [`pe`]: PE/COFF loader (headers, sections, imports/exports/delay-load)
 //! - [`elf`]: ELF64 loader (headers, symbols, dynamic section, relocations)
 //! - [`macho`]: Mach-O loader (thin and fat/universal images)
+//! - [`objc`]: Objective-C class/method recovery from `__objc_*` sections
+//! - [`swift`]: Swift `__swift5_*` section inventory and type-descriptor names
+//! - [`flirt`]: open FLIRT-style CRC/pattern signature matching (text corpus)
 //! - [`x86`]: x86-64 instruction decoder with flow classification
 //! - [`aarch64`]: AArch64 instruction decoder with flow classification
 //! - [`model`]: format- and ISA-neutral trait layer ([`Image`], [`Decoder`],
@@ -47,18 +50,22 @@ pub mod irstack;
 pub mod mempromote;
 pub mod sig;
 pub mod types;
+pub mod irtype;
 pub mod elf;
 pub mod error;
 // The slice-19 evaluation harness: test-only, so it can drive `irout`'s
 // test-only SSA interpreter as its semantic oracle. Run: `cargo test evalfx`.
 #[cfg(test)]
 mod evalfx;
+pub mod flirt;
 pub mod funcs;
 pub mod jumptable;
 pub mod listing;
 pub mod macho;
 pub mod model;
+pub mod objc;
 pub mod parallel;
+pub mod swift;
 pub mod patch;
 pub mod pe;
 pub mod pseudo;

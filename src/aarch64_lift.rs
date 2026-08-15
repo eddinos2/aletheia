@@ -43,17 +43,17 @@
 //! the lower address); only `FMOV Vd.D[1], Xn` writes a half in
 //! isolation. Register 31 is `V31` — the file has no ZR/SP. The
 //! `a64.unknown` clobber now covers all 64 vector cells too, so the
-//! unmodeled remainder (remaining Advanced SIMD vector ALU beyond the
-//! three-same integer slice, LSE atomics, SVE, …) stays sound.
+//! unmodeled remainder (remaining Advanced SIMD beyond the three-same
+//! slice above, LSE atomics, SVE, …) stays sound.
 //! Scalar FP *arithmetic* lifts to precise named intrinsics over these
 //! cells — `a64.fadd` writes exactly `vlo(rd)` and reads its two
 //! operand cells, `a64.fcmp` writes exactly the four NZCV flags — so
 //! FP dataflow keeps real def-use chains even where the operation
 //! itself is opaque; every scalar FP write is followed by the
-//! architectural `vhi := 0`. The three-same integer ALU lifts bitwise
+//! architectural `vhi := 0`. The three-same ALU lifts bitwise
 //! AND/ORR/EOR (and `.2d` ADD/SUB) exactly over the two 64-bit cells;
-//! packed ADD/SUB of narrower lanes uses a precise named intrinsic
-//! writing the destination halves. `callfx`'s AAPCS64 summary covers the
+//! packed ADD/SUB, vector FADD/FMUL, and CMEQ/CMHI use precise named
+//! intrinsics writing the destination halves. `callfx`'s AAPCS64 summary covers the
 //! vector file both directions: v0–v7/v16–v31 and the high halves of
 //! v8–v15 clobbered (only the bottom 64 bits of v8–v15 are
 //! callee-saved), v0–v7 read as arguments and live-out as the return
@@ -545,10 +545,10 @@ fn fp_scalar_intr(name: &'static str, rdn: u8, reads: Vec<Expr>) -> Vec<Stmt> {
     ]
 }
 
-/// Advanced SIMD three-same integer ALU over the two 64-bit cells.
-/// Bitwise AND/ORR/EOR and `.2d` ADD/SUB are exact; packed ADD/SUB of
-/// narrower lanes is a precise named intrinsic. `Q = 0` zeroes the
-/// high half architecturally.
+/// Advanced SIMD three-same ALU over the two 64-bit cells.
+/// Bitwise AND/ORR/EOR and `.2d` ADD/SUB are exact; packed ADD/SUB,
+/// vector FADD/FMUL, and CMEQ/CMHI are precise named intrinsics.
+/// `Q = 0` zeroes the high half architecturally.
 fn simd_alu(op: aarch64::SimdAluOp, q: bool, size: u8, rdn: u8, rn: u8, rm: u8) -> Vec<Stmt> {
     use aarch64::SimdAluOp;
     let exact = match op {
@@ -574,6 +574,10 @@ fn simd_alu(op: aarch64::SimdAluOp, q: bool, size: u8, rdn: u8, rn: u8, rm: u8) 
     let name = match op {
         SimdAluOp::Add => "a64.vadd",
         SimdAluOp::Sub => "a64.vsub",
+        SimdAluOp::Fadd => "a64.vfadd",
+        SimdAluOp::Fmul => "a64.vfmul",
+        SimdAluOp::Cmeq => "a64.vcmeq",
+        SimdAluOp::Cmhi => "a64.vcmhi",
         _ => unreachable!("logical and .2d are exact"),
     };
     let mut reads = vec![rd(vlo(rn)), rd(vlo(rm))];
@@ -3942,6 +3946,44 @@ mod tests {
             reads.as_slice(),
             [rd(vlo(1)), rd(vlo(2)), rd(vhi(1)), rd(vhi(2))]
         );
+    }
+
+    #[test]
+    fn simd_three_same_fp_and_compare_lift_to_named_intrinsics() {
+        // fadd v0.4s, v1.4s, v2.4s → a64.vfadd over both halves.
+        let s = lift_word(0x4E22_D420);
+        assert_eq!(ir::check(&s), Ok(()));
+        let [Stmt::Intrinsic { name, writes, reads }] = s.as_slice() else {
+            panic!("expected a64.vfadd, got {s:?}");
+        };
+        assert_eq!(*name, "a64.vfadd");
+        assert_eq!(writes.as_slice(), [vlo(0), vhi(0)]);
+        assert_eq!(
+            reads.as_slice(),
+            [rd(vlo(1)), rd(vlo(2)), rd(vhi(1)), rd(vhi(2))]
+        );
+        // fmul v0.2s, v1.2s, v2.2s — Q = 0 zeroes the high half.
+        let s = lift_word(0x2E22_DC20);
+        assert_eq!(ir::check(&s), Ok(()));
+        let [Stmt::Intrinsic { name, writes, reads }, hi] = s.as_slice() else {
+            panic!("expected a64.vfmul + high zero, got {s:?}");
+        };
+        assert_eq!(*name, "a64.vfmul");
+        assert_eq!(writes.as_slice(), [vlo(0)]);
+        assert_eq!(reads.as_slice(), [rd(vlo(1)), rd(vlo(2))]);
+        assert_eq!(*hi, assign(vhi(0), k(0, Width::W64)));
+        // cmhi v0.4s, v1.4s, v2.4s
+        let s = lift_word(0x6EA2_3420);
+        let [Stmt::Intrinsic { name, .. }] = s.as_slice() else {
+            panic!("expected a64.vcmhi, got {s:?}");
+        };
+        assert_eq!(*name, "a64.vcmhi");
+        // cmeq v0.16b, v1.16b, v2.16b
+        let s = lift_word(0x6E22_8C20);
+        let [Stmt::Intrinsic { name, .. }] = s.as_slice() else {
+            panic!("expected a64.vcmeq, got {s:?}");
+        };
+        assert_eq!(*name, "a64.vcmeq");
     }
 
     // ---- scalar FP arithmetic: precise intrinsics, never the clobber ----

@@ -35,26 +35,30 @@ patch/diff) while staying clean-room and open.
 
 | Area | State |
 |---|---|
-| PE / ELF64 / Mach-O loaders | Working |
-| x86-64 + AArch64 decode | Working (A64 still deepening) |
+| PE / ELF64 / Mach-O loaders | Working (chained fixup walk) |
+| x86-64 + AArch64 decode | Working (SIMD ALU deepening) |
 | CFG, functions, xrefs, strings, jumptables | Working |
 | Parallel analysis (deterministic) | Working |
 | Open annotation DB (git-friendly) | Working |
-| IR → SSA → structure → `--decompile` | Working; readability deepening |
-| Go / Rust / C++ recoveries | Present, uneven depth |
-| PatchSet preview / sibling apply | Early |
-| MCP server (`aletheia-mcp`) | Early — agent entry point |
-| GUI | Spec + mockup only |
+| IR → SSA → MEM promote → structure → `--decompile` | Working (`local_*` + sig headers) |
+| Go / Rust / C++ / ObjC / Swift recoveries | Present, uneven depth |
+| Open FLIRT-style matcher (`--flirt`) | Early |
+| PatchSet + patch-from-diff | Working |
+| MCP server (`aletheia-mcp`) | Agent entry point |
+| Headless `--json` | Functions list |
+| GUI / TUI | Spec only (Gate G1 open) |
 
 ```console
 $ cargo run --bin redump -- ./target
 $ cargo run --bin redump -- ./a.out --listing
 $ cargo run --bin redump -- ./app --decompile=4
 $ cargo run --bin redump -- old.bin --diff new.bin
+$ cargo run --bin redump -- old.bin --patch-from-diff new.bin
+$ cargo run --bin redump -- ./app --json
 $ cargo run -p aletheia-mcp
 ```
 
-Agent loop (MCP): `open` → `decompile` / `diff` / `patch_preview` → annotate.
+Agent loop (MCP): `open` → `decompile` / `diff` / `listing` / `patch_preview` → `rename`.
 
 ### MCP headless smoke
 
