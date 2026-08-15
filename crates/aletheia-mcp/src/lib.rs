@@ -931,7 +931,7 @@ fn why(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
                     None => "null".into(),
                 };
                 let claim = match &name {
-                    Some(n) => format!("name = \"{}\" @ 0x{va:x}", escape_json(n)),
+                    Some(n) => format!("name = \"{n}\" @ 0x{va:x}"),
                     None => format!("function start @ 0x{va:x}"),
                 };
                 return json_ok(
@@ -939,6 +939,7 @@ fn why(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
                     &format!(
                         r#"{{"session_id":{sess_json},"fact_id":"{fact}","va":"0x{va:x}","name":{name_json},"trust":"{trust}","source":"{source_label}","chain":[{{"lab":"CLAIM","val":"{claim}"}},{{"lab":"SOURCE","val":"funcs::Source::{src} — {rule}"}},{{"lab":"NEGATIVE","val":"{negative}"}},{{"lab":"VERDICT","val":"{verdict}"}}],"stamp":{stamp}}}"#,
                         fact = escape_json(&fact),
+                        claim = escape_json(&claim),
                         src = match source {
                             Some(funcs::Source::EntryPoint) => "EntryPoint",
                             Some(funcs::Source::Symbol) => "Symbol",

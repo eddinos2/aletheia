@@ -52,13 +52,49 @@ $ ./scripts/macos-app.sh --release   # → dist/Aletheia.app
 $ ./scripts/macos-dmg.sh --release   # → dist/Aletheia-*-unsigned.dmg
 ```
 
-Requires macOS + Xcode CLT. Builds are **ad-hoc signed / unsigned** for
-local use (no Developer ID required). Distribution notarization needs an
-Apple Developer ID:
+Requires macOS + Xcode CLT. `./scripts/macos-dmg.sh --release` builds the
+app then packages `dist/Aletheia-<version>-unsigned.dmg` (create-dmg if
+installed, else `hdiutil`).
 
-1. `codesign --deep --force --options runtime --sign "Developer ID Application: …" dist/Aletheia.app`
-2. Package DMG, then `xcrun notarytool submit … --wait`
-3. `xcrun stapler staple dist/Aletheia-*.dmg`
+### Signing honesty
+
+Local scripts produce an **ad-hoc** signature when `codesign` is available
+(`codesign --sign -`), otherwise a fully **unsigned** app/DMG. That is
+enough to `open dist/Aletheia.app` on the build machine. It is **not**
+Developer ID signing and **not** notarized — Gatekeeper will block
+distribution to other Macs until you notarize with a paid Apple Developer
+account. These scripts do not fake or stub notarization.
+
+### Notarization prerequisites (you bring these)
+
+Not shipped / not automated here. You need:
+
+1. Apple Developer Program membership and a **Developer ID Application**
+   certificate installed in the login keychain.
+2. An App Store Connect API key (or Apple ID + app-specific password) for
+   `notarytool`.
+3. Hardened runtime entitlements appropriate for your binary (GUI + any
+   spawned helpers).
+
+Typical sequence after a release app build:
+
+```console
+$ codesign --deep --force --options runtime \
+    --sign "Developer ID Application: Your Name (TEAMID)" \
+    dist/Aletheia.app
+$ ./scripts/macos-dmg.sh --release   # or package the already-signed .app
+$ xcrun notarytool submit dist/Aletheia-*-unsigned.dmg \
+    --apple-id "…" --team-id "…" --password "…" --wait
+$ xcrun stapler staple dist/Aletheia-*.dmg
+```
+
+Rename the DMG away from `-unsigned` once stapled if you distribute it.
+Until then, treat artifacts as local-only.
+
+## Bench / smoke
+
+Headless protocol + `redump`: `./scripts/bench-smoke.sh`  
+Timed GUI checklist: [docs/GUI_BENCH_CHECKLIST.md](../../docs/GUI_BENCH_CHECKLIST.md)
 
 ## Gate G1 status
 

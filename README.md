@@ -66,23 +66,27 @@ GUI loop: ⌘O → select function → `y` decompile / `c` CFG / click xrefs /
 `n` rename (delta) / `?` Why? — same protocol as agents. See
 [crates/aletheia-gui/README.md](crates/aletheia-gui/README.md).
 
-### MCP headless smoke
+### Bench / headless smoke
 
-With `aletheia-mcp` on `PATH` (or via `cargo run -p aletheia-mcp`):
+```console
+$ ./scripts/bench-smoke.sh           # MCP + redump vs fixtures/; prints BENCH_SMOKE_SUMMARY
+$ ./scripts/bench-smoke.sh --release # optional
+```
 
-1. Start the server over stdio from your agent host (Cursor / Claude / etc.).
-2. Call `health`, then `open` on a local fixture under `fixtures/`.
-3. Call `decompile` on a known function index and confirm non-empty pseudocode.
-4. Optional: `why` on the same address to verify provenance text.
+Timed open → functions → decompile → rename → xref → CFG → diff → patch
+checklist (GUI interactive + headless): [docs/GUI_BENCH_CHECKLIST.md](docs/GUI_BENCH_CHECKLIST.md).
+Local baseline numbers: [docs/BENCH_BASELINE.md](docs/BENCH_BASELINE.md).
 
-Full GUI + engine checklist: [docs/GUI_BENCH_CHECKLIST.md](docs/GUI_BENCH_CHECKLIST.md).
-
-### macOS package (unsigned)
+### macOS package (unsigned / ad-hoc)
 
 ```console
 $ ./scripts/macos-app.sh --release
 $ ./scripts/macos-dmg.sh --release
 ```
+
+Notarization needs a real Apple Developer ID — see
+[crates/aletheia-gui/README.md](crates/aletheia-gui/README.md). Scripts do
+not fake signing.
 
 
 ## Design principles
