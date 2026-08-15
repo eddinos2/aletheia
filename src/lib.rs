@@ -10,7 +10,7 @@
 //! - [`elf`]: ELF64 loader (headers, symbols, dynamic section, relocations)
 //! - [`macho`]: Mach-O loader (thin and fat/universal images)
 //! - [`objc`]: Objective-C class/method recovery from `__objc_*` sections
-//! - [`swift`]: Swift `__swift5_*` section inventory and type-descriptor names
+//! - [`swift`]: Swift `__swift5_*` inventory, types/fields, protocol conformances
 //! - [`flirt`]: open FLIRT-style CRC/pattern signature matching (text corpus)
 //! - [`x86`]: x86-64 instruction decoder with flow classification
 //! - [`aarch64`]: AArch64 instruction decoder with flow classification
@@ -29,6 +29,7 @@ pub mod aarch64_lift;
 pub mod aarch64_text;
 pub mod anchor;
 pub mod annotate;
+pub mod api;
 pub mod asmtext;
 pub mod callfx;
 pub mod cfg;

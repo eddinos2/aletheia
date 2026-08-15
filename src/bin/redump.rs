@@ -66,8 +66,9 @@ const USAGE: &str = "usage: redump <file> [--headers] [--sections] [--imports] [
                 cannot get on packed, unterminated Go string data
   --objc[=N]    recover Objective-C classes and methods from Mach-O
                 __objc_classlist / method lists (default N=4096 classes)
-  --swift[=N]   inventory Mach-O __swift5_* sections and recover nominal
-                type names from __swift5_types (default N=4096 types)
+  --swift[=N]   inventory Mach-O __swift5_* sections; recover type names /
+                fields from __swift5_types and protocol conformances from
+                __swift5_proto (default N=4096 types)
   --lift[=N]    lift the recovered program to the register-transfer IR and
                 print it (x86-64 and aarch64), for at most N functions
                 (default 4)

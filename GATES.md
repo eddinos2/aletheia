@@ -21,7 +21,7 @@ graph is cheap; typed prototypes via `irtype` + `types::ParamTypeMap::render_pro
 - [x] `confirm_returns` on decompile / MCP / `--sigs` when CG edges ≤ cap
 - [x] Typed pseudo headers from irtype evidence (safe presentation)
 - [x] ObjC `__objc_selrefs` listing
-- [x] Swift `__swift5_proto` conformance VA list
+- [x] Swift `__swift5_proto` conformance detail (protocol/type/flags)
 - [x] A64 `PRFM` (unsigned offset) + scalar `CRC32*`
 - [x] Patch `assemble_patch` beyond NOP (RET / B / BR / MOVZ)
 - [x] Open FLIRT sample under `testdata/flirt/sample.corpus`
@@ -51,6 +51,13 @@ graph is cheap; typed prototypes via `irtype` + `types::ParamTypeMap::render_pro
 - [x] `aletheia-mcp` stdio skeleton with `health` / `open` / `decompile` /
       `why` tools (progress/cancel stubs)
 - [x] Agent can decompile without GUI (manual smoke via stdio JSON)
+
+## Gate S1 — Scripting / plugin ABI
+
+- [x] Versioned `aletheia::api` (`API_VERSION` 1.0.0) with `AnalysisSession`
+- [x] Documented contract in [docs/PLUGIN_ABI.md](docs/PLUGIN_ABI.md)
+- [x] MCP `health` exposes `api_version` (wire handshake)
+- [x] In-process tests: open → functions → decompile → rename
 
 ## Gate G1 — GUI / protocol surface
 

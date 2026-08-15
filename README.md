@@ -77,6 +77,8 @@ Timed open → functions → decompile → rename → xref → CFG → diff → 
 checklist (GUI interactive + headless): [docs/GUI_BENCH_CHECKLIST.md](docs/GUI_BENCH_CHECKLIST.md).
 Fixture guidance: [docs/ADVERSARIAL_FIXTURES.md](docs/ADVERSARIAL_FIXTURES.md).
 Local baseline numbers: [docs/BENCH_BASELINE.md](docs/BENCH_BASELINE.md).
+Scorecard template: [docs/SCORECARD.md](docs/SCORECARD.md).
+Scripting ABI: [docs/PLUGIN_ABI.md](docs/PLUGIN_ABI.md) (`aletheia::api`).
 
 ### macOS package (unsigned / ad-hoc)
 

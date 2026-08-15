@@ -54,10 +54,10 @@ and Apple/iOS support over time.
 
 | Track | Landed | Next |
 |---|---|---|
-| **Engine** | irstack, sig, MEM promote, irtype evidence, **typebounds E3**, FLIRT sample | FLIRT corpus growth; scripting ABI |
-| **iOS / Apple** | chained walk, ObjC + selrefs, Swift types/proto/**fields** | deeper Swift ABI / protocol witnesses |
+| **Engine** | irstack, sig, MEM promote, irtype, **typebounds E3**, FLIRT sample, **api 1.0** | FLIRT corpus growth |
+| **iOS / Apple** | chained walk, ObjC + selrefs, Swift types/fields/**conformances** | witness table slot depth |
 | **Patch / Diff** | PatchSet, patch-from-diff, A64 assemble | codesign recipe depth |
-| **Agents / UI** | MCP, `--json`, GUI G1, bench smoke | finer delta ids; notarized DMG |
+| **Agents / UI** | MCP, `--json`, GUI G1, bench smoke, **api 1.0** | finer delta ids; notarized DMG |
 
 Gates: see [GATES.md](GATES.md).
 
@@ -73,7 +73,7 @@ Loaders, decoders, CFG/funcs/xrefs, parallel engine, open annotations.
 - [x] MCP server (`aletheia-mcp`: open/decompile/diff/patch/listing/stack/xrefs/rename)
 - [x] Headless `--json` (functions)
 - [x] Native GUI Gate G1 (`aletheia-gui` — xref nav, CFG graph, rename deltas)
-- [ ] Stable scripting / plugin ABI
+- [x] Stable scripting / plugin ABI (`aletheia::api` + [docs/PLUGIN_ABI.md](docs/PLUGIN_ABI.md))
 
 ### Phase 5 — Differentiators + decompiler — in progress
 

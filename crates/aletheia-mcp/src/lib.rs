@@ -96,7 +96,8 @@ fn health(state: &Arc<Mutex<State>>, id: u64) -> String {
     json_ok(
         id,
         &format!(
-            r#"{{"ok":true,"engine_version":"{ENGINE_VERSION}","busy_jobs":{busy},"stamp":{}}}"#,
+            r#"{{"ok":true,"engine_version":"{ENGINE_VERSION}","api_version":"{}","busy_jobs":{busy},"stamp":{}}}"#,
+            aletheia::api::API_VERSION,
             stamp_engine()
         ),
     )

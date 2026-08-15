@@ -1,9 +1,10 @@
 //! Swift reflection metadata inventory from Mach-O `__swift5_*` sections.
 //!
 //! Clean-room layout from Apple's published Swift ABI documents
-//! (`docs/ABI/TypeMetadata.rst`, `docs/ABI/Mangling.rst`) and the Mach-O
-//! section names the Swift toolchain emits (`__swift5_types`,
-//! `__swift5_typeref`, `__swift5_reflstr`, …). This early track:
+//! (`docs/ABI/TypeMetadata.rst`, `docs/ABI/Mangling.rst`, public
+//! `MetadataValues.h` conformance flags) and the Mach-O section names
+//! the Swift toolchain emits (`__swift5_types`, `__swift5_typeref`,
+//! `__swift5_reflstr`, `__swift5_proto`, …). This early track:
 //!
 //! 1. Inventories every `__swift5_*` section (segment, name, VA, size).
 //! 2. Walks `__swift5_types` as an array of 32-bit relative direct
@@ -13,7 +14,10 @@
 //! 3. Follows each type's `Fields` relative pointer to a public ABI
 //!    `FieldDescriptor`, recovering per-field names and mangled type
 //!    names from `FieldRecord`s (capped).
-//! 4. Optionally samples printable C-strings from `__swift5_reflstr`
+//! 4. Walks `__swift5_proto` relative pointers to
+//!    `ProtocolConformanceDescriptor`s, recovering protocol / type
+//!    names and `ConformanceFlags` when safely readable.
+//! 5. Optionally samples printable C-strings from `__swift5_reflstr`
 //!    and mangled-looking UTF-8 runs from `__swift5_typeref`.
 //!
 //! Full Swift demangling (`$s…` → readable signatures) is deliberately
@@ -65,6 +69,14 @@ const MAX_PARENT_DEPTH: usize = 8;
 /// `Flags` + `Parent` + `Name` + `AccessFunction` + `Fields`.
 const TYPE_DESC_MIN: u64 = 20;
 
+/// Public ABI `ProtocolConformanceDescriptor` size:
+/// `Protocol` + `TypeRef` + `WitnessTablePattern` + `ConformanceFlags`.
+const CONFORMANCE_DESC_SIZE: u64 = 16;
+
+/// Minimum readable size of a protocol / type context descriptor name:
+/// `Flags` + `Parent` + `Name`.
+const CONTEXT_NAME_MIN: u64 = 12;
+
 /// Public ABI `FieldDescriptor` header size (before `FieldRecord`s):
 /// `MangledTypeName` + `Superclass` + `Kind` + `FieldRecordSize` + `NumFields`.
 const FIELD_DESC_HEADER: u64 = 16;
@@ -80,9 +92,25 @@ const KIND_MASK: u32 = 0x1F;
 
 /// Public `ContextDescriptorKind` values used here.
 const KIND_MODULE: u32 = 0;
+const KIND_PROTOCOL: u32 = 3;
 const KIND_CLASS: u32 = 16;
 const KIND_STRUCT: u32 = 17;
 const KIND_ENUM: u32 = 18;
+
+/// `ConformanceFlags` type-reference kind (bits 3..5).
+const TYPE_REF_KIND_MASK: u32 = 0x7 << 3;
+const TYPE_REF_KIND_SHIFT: u32 = 3;
+
+/// Public `TypeReferenceKind` values used when resolving the conforming type.
+const TYPE_REF_DIRECT_TYPE_DESC: u32 = 0;
+const TYPE_REF_INDIRECT_TYPE_DESC: u32 = 1;
+const TYPE_REF_DIRECT_OBJC_CLASS_NAME: u32 = 2;
+const TYPE_REF_INDIRECT_OBJC_CLASS: u32 = 3;
+
+/// Low bit of a relative-indirectable pointer: target is a pointer slot.
+const REL_INDIRECT_BIT: i32 = 0x1;
+/// Second bit of a protocol relative pointer: Objective-C protocol ref.
+const REL_PROTOCOL_IS_OBJC_BIT: i32 = 0x2;
 
 /// Why Swift recovery refused to produce a usable image view.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +232,25 @@ pub struct SwiftType {
     pub fields: Vec<SwiftField>,
 }
 
+/// One recovered protocol conformance from `__swift5_proto`.
+///
+/// Layout follows the public `ProtocolConformanceDescriptor`: protocol
+/// relative pointer, type/context relative pointer, witness-table
+/// pattern (not recovered here), and `ConformanceFlags`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwiftConformance {
+    /// Virtual address of the conformance descriptor.
+    pub va: u64,
+    /// Protocol name when the protocol relative pointer resolves to a
+    /// readable Swift protocol context descriptor `Name` string.
+    pub protocol_name: Option<String>,
+    /// Conforming type / ObjC class name when the type relative pointer
+    /// is resolvable under `ConformanceFlags` type-reference kind.
+    pub type_name: Option<String>,
+    /// Raw `ConformanceFlags` word (`0` when the flags field was unreadable).
+    pub flags: u32,
+}
+
 /// Recovered Swift metadata for one thin Mach-O image.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SwiftImage {
@@ -225,8 +272,8 @@ pub struct SwiftImage {
     pub typerefs: Vec<String>,
     /// True when typeref recovery hit [`MAX_STRINGS`].
     pub typerefs_capped: bool,
-    /// Protocol conformance descriptor VAs from `__swift5_proto`.
-    pub proto_conformances: Vec<u64>,
+    /// Protocol conformances from `__swift5_proto` (capped).
+    pub proto_conformances: Vec<SwiftConformance>,
     /// True when proto recovery hit [`MAX_PROTO_CONFORMANCES`].
     pub proto_capped: bool,
     /// File VA of `__swift5_proto` when present.
@@ -288,8 +335,9 @@ pub fn recover_capped(mach: &MachFile, data: &[u8], max_types: usize) -> SwiftRe
 
     if let Some(sect) = find_section(mach, "__swift5_proto") {
         image.proto_va = Some(sect.addr);
-        let (vas, capped) = parse_rel32_list(mach, data, sect, MAX_PROTO_CONFORMANCES)?;
-        image.proto_conformances = vas;
+        let (conformances, capped) =
+            parse_proto_section(mach, data, sect, MAX_PROTO_CONFORMANCES)?;
+        image.proto_conformances = conformances;
         image.proto_capped = capped;
     }
 
@@ -425,8 +473,14 @@ pub fn render(image: &SwiftImage, max_types: usize) -> String {
                 ""
             }
         );
-        for va in image.proto_conformances.iter().take(32) {
-            let _ = writeln!(out, "    proto @{va:#x}");
+        for conf in image.proto_conformances.iter().take(32) {
+            let ty = conf.type_name.as_deref().unwrap_or("?");
+            let proto = conf.protocol_name.as_deref().unwrap_or("?");
+            let _ = writeln!(
+                out,
+                "    {ty} : {proto}  // va {:#x}  flags {:#x}",
+                conf.va, conf.flags
+            );
         }
         if image.proto_conformances.len() > 32 {
             let _ = writeln!(
@@ -602,19 +656,19 @@ fn parse_types_section(
     Ok((types, capped))
 }
 
-/// Walk a section of relative 32-bit pointers (same layout as
-/// `__swift5_types` / `__swift5_proto`), returning resolved VAs.
-fn parse_rel32_list(
+/// Walk `__swift5_proto` relative pointers and parse each
+/// `ProtocolConformanceDescriptor` (soft-skipping corrupt entries).
+fn parse_proto_section(
     mach: &MachFile,
     data: &[u8],
     sect: &Section64,
     max: usize,
-) -> SwiftResult<(Vec<u64>, bool)> {
+) -> SwiftResult<(Vec<SwiftConformance>, bool)> {
     let bytes = section_bytes(data, sect)?;
     let n = bytes.len() / 4;
     if n > max.max(MAX_PROTO_CONFORMANCES) {
         return Err(SwiftError::CapExceeded {
-            what: "relative pointer list",
+            what: "protocol conformance relative pointers",
             value: n,
             cap: max,
         });
@@ -635,19 +689,160 @@ fn parse_rel32_list(
         let Some(target) = relative_va(entry_va, rel) else {
             continue;
         };
-        if target == 0 || out.contains(&target) {
+        if target == 0 || out.iter().any(|c: &SwiftConformance| c.va == target) {
             continue;
         }
-        // Ensure the descriptor start is file-backed (soft skip).
         if mach.vaddr_to_offset(target).is_err() {
             continue;
         }
-        out.push(target);
+        out.push(parse_conformance_descriptor(mach, data, target));
     }
     if !capped && n > max {
         capped = true;
     }
     Ok((out, capped))
+}
+
+/// Parse a public ABI `ProtocolConformanceDescriptor` at `desc_va`.
+///
+/// Always returns a record for a file-backed VA; unreadable fields soft-fail
+/// to `None` / `flags = 0` rather than aborting recovery.
+fn parse_conformance_descriptor(
+    mach: &MachFile,
+    data: &[u8],
+    desc_va: u64,
+) -> SwiftConformance {
+    let Some(_) = bytes_at(mach, data, desc_va, CONFORMANCE_DESC_SIZE as usize) else {
+        return SwiftConformance {
+            va: desc_va,
+            protocol_name: None,
+            type_name: None,
+            flags: 0,
+        };
+    };
+    let flags = read_u32(mach, data, desc_va + 12).unwrap_or(0);
+    let protocol_name = read_i32(mach, data, desc_va)
+        .and_then(|rel| resolve_protocol_name(mach, data, desc_va, rel));
+    let type_name = read_i32(mach, data, desc_va + 4).and_then(|rel| {
+        resolve_conformance_type_name(mach, data, desc_va + 4, rel, flags)
+    });
+    SwiftConformance {
+        va: desc_va,
+        protocol_name,
+        type_name,
+        flags,
+    }
+}
+
+/// Resolve the protocol relative field (relative-indirectable; bit 1 = ObjC).
+fn resolve_protocol_name(
+    mach: &MachFile,
+    data: &[u8],
+    field_va: u64,
+    rel: i32,
+) -> Option<String> {
+    if rel == 0 {
+        return None;
+    }
+    // RelativeIndirectablePointerIntPair: bit0 = indirect, bit1 = isObjC.
+    if rel & REL_PROTOCOL_IS_OBJC_BIT != 0 {
+        return None;
+    }
+    let proto_va = resolve_relative_indirectable(mach, data, field_va, rel)?;
+    read_context_display_name(mach, data, proto_va, Some(KIND_PROTOCOL))
+}
+
+/// Resolve the conforming-type relative field using `ConformanceFlags`.
+fn resolve_conformance_type_name(
+    mach: &MachFile,
+    data: &[u8],
+    field_va: u64,
+    rel: i32,
+    flags: u32,
+) -> Option<String> {
+    if rel == 0 {
+        return None;
+    }
+    let kind = (flags & TYPE_REF_KIND_MASK) >> TYPE_REF_KIND_SHIFT;
+    match kind {
+        TYPE_REF_DIRECT_TYPE_DESC => {
+            let ty_va = relative_va(field_va, rel)?;
+            read_context_display_name(mach, data, ty_va, None)
+        }
+        TYPE_REF_INDIRECT_TYPE_DESC => {
+            let slot_va = relative_va(field_va, rel)?;
+            let ty_va = read_ptr(mach, data, slot_va)?;
+            if ty_va == 0 {
+                return None;
+            }
+            read_context_display_name(mach, data, ty_va, None)
+        }
+        TYPE_REF_DIRECT_OBJC_CLASS_NAME => {
+            let name_va = relative_va(field_va, rel)?;
+            read_cstr(mach, data, name_va).filter(|s| looks_like_swift_ident(s))
+        }
+        TYPE_REF_INDIRECT_OBJC_CLASS => None,
+        _ => None,
+    }
+}
+
+/// Apply a relative-indirectable offset (low bit = indirect pointer slot).
+fn resolve_relative_indirectable(
+    mach: &MachFile,
+    data: &[u8],
+    field_va: u64,
+    rel: i32,
+) -> Option<u64> {
+    if rel == 0 {
+        return None;
+    }
+    let indirect = rel & REL_INDIRECT_BIT != 0;
+    // Clear low bit(s) reserved for flags; keep signed magnitude of the offset.
+    let offset = rel & !REL_INDIRECT_BIT & !REL_PROTOCOL_IS_OBJC_BIT;
+    let target = relative_va(field_va, offset)?;
+    if !indirect {
+        return Some(target);
+    }
+    let abs = read_ptr(mach, data, target)?;
+    if abs == 0 {
+        None
+    } else {
+        Some(abs)
+    }
+}
+
+fn read_ptr(mach: &MachFile, data: &[u8], va: u64) -> Option<u64> {
+    // Thin Mach-O recovery is 64-bit only (`MH_MAGIC_64`).
+    let b = bytes_at(mach, data, va, 8)?;
+    Some(u64::from_le_bytes(b.try_into().ok()?))
+}
+
+/// Read a context descriptor's `Name` (+ optional module prefix).
+///
+/// When `expect_kind` is set, the descriptor's kind bits must match.
+fn read_context_display_name(
+    mach: &MachFile,
+    data: &[u8],
+    desc_va: u64,
+    expect_kind: Option<u32>,
+) -> Option<String> {
+    let _ = bytes_at(mach, data, desc_va, CONTEXT_NAME_MIN as usize)?;
+    let flags = read_u32(mach, data, desc_va)?;
+    if let Some(kind) = expect_kind
+        && flags & KIND_MASK != kind
+    {
+        return None;
+    }
+    let name_rel = read_i32(mach, data, desc_va + 8)?;
+    let name_va = relative_va(desc_va + 8, name_rel)?;
+    let name = read_cstr(mach, data, name_va)?;
+    if !looks_like_swift_ident(&name) {
+        return None;
+    }
+    match resolve_module_name(mach, data, desc_va) {
+        Some(module) if !module.is_empty() => Some(format!("{module}.{name}")),
+        _ => Some(name),
+    }
 }
 
 fn parse_type_descriptor(mach: &MachFile, data: &[u8], desc_va: u64) -> Option<SwiftType> {
@@ -928,6 +1123,10 @@ mod tests {
     const TYPES_OFF: usize = 0x340; // __swift5_types (one rel32)
     const REFLSECT_OFF: usize = 0x350;
     const TYPREFSECT_OFF: usize = 0x360;
+    const PROTO_NAME_OFF: usize = 0x380; // "Named\0"
+    const PROTO_DESC_OFF: usize = 0x388; // protocol descriptor
+    const CONF_DESC_OFF: usize = 0x3A0; // ProtocolConformanceDescriptor
+    const PROTOSECT_OFF: usize = 0x3B0; // __swift5_proto (one rel32)
 
     /// Public ABI `FieldDescriptorKind::Struct`.
     const FIELD_KIND_STRUCT: u16 = 0;
@@ -971,15 +1170,16 @@ mod tests {
     }
 
     /// Thin arm64 Mach-O with one Swift struct `App.Demo` having two
-    /// fields (`count: Int`, `label: String`) plus sample
+    /// fields (`count: Int`, `label: String`), a `Named` protocol
+    /// conformance (`App.Demo : App.Named`), plus sample
     /// `__swift5_reflstr` / `__swift5_typeref` strings.
     fn synthetic_swift_macho() -> Vec<u8> {
         let mut img = vec![0u8; IMG_SIZE];
 
-        // One LC_SEGMENT_64 __TEXT with 5 sections.
-        // cmdsize = 72 + 5*80 = 472.
+        // One LC_SEGMENT_64 __TEXT with 6 sections.
+        // cmdsize = 72 + 6*80 = 552.
         let ncmds = 1u32;
-        let sizeofcmds = 472u32;
+        let sizeofcmds = 552u32;
 
         put32(&mut img, 0, MH_MAGIC_64);
         put32(&mut img, 4, 0x0100_000C); // ARM64
@@ -991,7 +1191,7 @@ mod tests {
 
         let t = 0x20;
         put32(&mut img, t, LC_SEGMENT_64);
-        put32(&mut img, t + 4, 472);
+        put32(&mut img, t + 4, 552);
         put(&mut img, t + 8, b"__TEXT");
         put64(&mut img, t + 24, TEXT_VM);
         put64(&mut img, t + 32, 0x400);
@@ -999,7 +1199,7 @@ mod tests {
         put64(&mut img, t + 48, 0x400);
         put32(&mut img, t + 56, VM_PROT_READ | VM_PROT_EXECUTE);
         put32(&mut img, t + 60, VM_PROT_READ | VM_PROT_EXECUTE);
-        put32(&mut img, t + 64, 5); // nsects
+        put32(&mut img, t + 64, 6); // nsects
 
         write_section(
             &mut img,
@@ -1016,7 +1216,7 @@ mod tests {
             b"__const",
             b"__TEXT",
             TEXT_VM + MODULE_OFF as u64,
-            0x80,
+            0x100,
             MODULE_OFF as u32,
         );
         write_section(
@@ -1046,6 +1246,15 @@ mod tests {
             0x20,
             TYPREFSECT_OFF as u32,
         );
+        write_section(
+            &mut img,
+            t + 72 + 400,
+            b"__swift5_proto",
+            b"__TEXT",
+            TEXT_VM + PROTOSECT_OFF as u64,
+            4,
+            PROTOSECT_OFF as u32,
+        );
 
         // Strings.
         put(&mut img, NAME_OFF, b"Demo\0");
@@ -1055,6 +1264,7 @@ mod tests {
         put(&mut img, FTYPE0_OFF, b"$sSi\0");
         put(&mut img, FTYPE1_OFF, b"$sSS\0");
         put(&mut img, TYPREF_OFF, b"$s3App4DemoV\0");
+        put(&mut img, PROTO_NAME_OFF, b"Named\0");
 
         // Module descriptor at MODULE_OFF.
         let mod_va = TEXT_VM + MODULE_OFF as u64;
@@ -1139,6 +1349,46 @@ mod tests {
         put(&mut img, REFLSECT_OFF, b"count\0label\0\0\0");
         put(&mut img, TYPREFSECT_OFF, b"$s3App4DemoV\0$sSi\0$sSS\0");
 
+        // Protocol descriptor at PROTO_DESC_OFF (`App.Named`).
+        let proto_va = TEXT_VM + PROTO_DESC_OFF as u64;
+        put32(&mut img, PROTO_DESC_OFF, KIND_PROTOCOL);
+        put_i32(
+            &mut img,
+            PROTO_DESC_OFF + 4,
+            rel32(proto_va + 4, mod_va),
+        );
+        put_i32(
+            &mut img,
+            PROTO_DESC_OFF + 8,
+            rel32(proto_va + 8, TEXT_VM + PROTO_NAME_OFF as u64),
+        );
+        put32(&mut img, PROTO_DESC_OFF + 12, 0); // NumRequirementsInSignature
+        put32(&mut img, PROTO_DESC_OFF + 16, 0); // NumRequirements
+        put_i32(&mut img, PROTO_DESC_OFF + 20, 0); // AssociatedTypeNames
+
+        // ProtocolConformanceDescriptor: Demo : Named (direct type desc).
+        let conf_va = TEXT_VM + CONF_DESC_OFF as u64;
+        put_i32(
+            &mut img,
+            CONF_DESC_OFF,
+            rel32(conf_va, proto_va),
+        ); // Protocol (direct)
+        put_i32(
+            &mut img,
+            CONF_DESC_OFF + 4,
+            rel32(conf_va + 4, struct_va),
+        ); // TypeRef (direct type descriptor)
+        put_i32(&mut img, CONF_DESC_OFF + 8, 0); // WitnessTablePattern
+        put32(
+            &mut img,
+            CONF_DESC_OFF + 12,
+            TYPE_REF_DIRECT_TYPE_DESC << TYPE_REF_KIND_SHIFT,
+        );
+
+        // __swift5_proto: one relative pointer to the conformance.
+        let proto_sect_va = TEXT_VM + PROTOSECT_OFF as u64;
+        put_i32(&mut img, PROTOSECT_OFF, rel32(proto_sect_va, conf_va));
+
         img
     }
 
@@ -1186,14 +1436,20 @@ mod tests {
         let img = synthetic_swift_macho();
         let mach = MachFile::parse(&img).unwrap();
         assert!(mach.section_by_name("__TEXT", "__swift5_types").is_some());
+        assert!(mach.section_by_name("__TEXT", "__swift5_proto").is_some());
 
         let sw = recover(&mach, &img).expect("swift");
         assert!(sw.has_swift_sections());
-        assert_eq!(sw.sections.len(), 3);
+        assert_eq!(sw.sections.len(), 4);
         assert!(
             sw.sections
                 .iter()
                 .any(|s| s.sectname == "__swift5_types")
+        );
+        assert!(
+            sw.sections
+                .iter()
+                .any(|s| s.sectname == "__swift5_proto")
         );
         assert_eq!(sw.len(), 1);
         assert_eq!(sw.types[0].name, "Demo");
@@ -1220,15 +1476,31 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_recovers_proto_conformance_detail() {
+        let img = synthetic_swift_macho();
+        let mach = MachFile::parse(&img).unwrap();
+        let sw = recover(&mach, &img).expect("swift");
+        assert_eq!(sw.proto_conformances.len(), 1, "{:?}", sw.proto_conformances);
+        let conf = &sw.proto_conformances[0];
+        assert_eq!(conf.va, TEXT_VM + CONF_DESC_OFF as u64);
+        assert_eq!(conf.protocol_name.as_deref(), Some("App.Named"));
+        assert_eq!(conf.type_name.as_deref(), Some("App.Demo"));
+        assert_eq!(conf.flags, TYPE_REF_DIRECT_TYPE_DESC << TYPE_REF_KIND_SHIFT);
+        assert!(!sw.proto_capped);
+    }
+
+    #[test]
     fn render_lists_types_and_inventory() {
         let img = synthetic_swift_macho();
         let mach = MachFile::parse(&img).unwrap();
         let sw = recover(&mach, &img).unwrap();
         let text = render(&sw, 16);
         assert!(text.contains("__swift5_types"), "{text}");
+        assert!(text.contains("__swift5_proto"), "{text}");
         assert!(text.contains("struct App.Demo"), "{text}");
         assert!(text.contains("count : $sSi"), "{text}");
         assert!(text.contains("label : $sSS"), "{text}");
+        assert!(text.contains("App.Demo : App.Named"), "{text}");
         assert!(text.contains("refl \"count\""), "{text}");
         assert!(text.contains("typeref \"$s3App4DemoV\""), "{text}");
     }
@@ -1241,6 +1513,8 @@ mod tests {
         assert!(sw.types.is_empty());
         assert!(sw.types_capped);
         assert!(sw.has_swift_sections());
+        // Proto walk is independent of the type cap.
+        assert_eq!(sw.proto_conformances.len(), 1);
     }
 
     #[test]
@@ -1266,5 +1540,35 @@ mod tests {
         let sw = recover(&mach, &img).unwrap();
         assert_eq!(sw.types.len(), 1);
         assert!(sw.types[0].fields.is_empty());
+    }
+
+    #[test]
+    fn corrupt_conformance_pointers_do_not_panic() {
+        let mut img = synthetic_swift_macho();
+        // Zero protocol + type relative pointers; flags remain readable.
+        put_i32(&mut img, CONF_DESC_OFF, 0);
+        put_i32(&mut img, CONF_DESC_OFF + 4, 0);
+        put32(&mut img, CONF_DESC_OFF + 12, 0xDEAD_BEEF);
+        let mach = MachFile::parse(&img).unwrap();
+        let sw = recover(&mach, &img).expect("swift");
+        assert_eq!(sw.proto_conformances.len(), 1);
+        let conf = &sw.proto_conformances[0];
+        assert_eq!(conf.protocol_name, None);
+        assert_eq!(conf.type_name, None);
+        assert_eq!(conf.flags, 0xDEAD_BEEF);
+        let text = render(&sw, 16);
+        assert!(text.contains("? : ?"), "{text}");
+        assert!(text.contains("flags 0xdeadbeef"), "{text}");
+    }
+
+    #[test]
+    fn proto_cap_truncates_without_panic() {
+        let img = synthetic_swift_macho();
+        let mach = MachFile::parse(&img).unwrap();
+        // Directly exercise the proto walker with a zero cap.
+        let sect = mach.section_by_name("__TEXT", "__swift5_proto").unwrap();
+        let (list, capped) = parse_proto_section(&mach, &img, sect, 0).unwrap();
+        assert!(list.is_empty());
+        assert!(capped);
     }
 }
