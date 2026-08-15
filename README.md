@@ -56,6 +56,18 @@ $ cargo run -p aletheia-mcp
 
 Agent loop (MCP): `open` → `decompile` / `diff` / `patch_preview` → annotate.
 
+### MCP headless smoke
+
+With `aletheia-mcp` on `PATH` (or via `cargo run -p aletheia-mcp`):
+
+1. Start the server over stdio from your agent host (Cursor / Claude / etc.).
+2. Call `health`, then `open` on a local fixture under `fixtures/`.
+3. Call `decompile` on a known function index and confirm non-empty pseudocode.
+4. Optional: `why` on the same address to verify provenance text.
+
+This is the Gate M1 manual smoke until the TUI lands — no GUI required.
+
+
 ## Design principles
 
 1. **Library first** — CLI, MCP, and future UI are thin clients.
