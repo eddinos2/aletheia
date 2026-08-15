@@ -290,6 +290,18 @@ pub fn modified_hunks(
     out
 }
 
+/// Turn every [`crate::diff::MatchKind::Modified`] pair in `diff` into a
+/// [`DiffHunk`] (prefix window of up to `cap` bytes at each entry).
+pub fn hunks_from_modified(
+    old: &dyn Image,
+    new: &dyn Image,
+    diff: &crate::diff::Diff,
+    cap: usize,
+) -> Vec<DiffHunk> {
+    let pairs = diff.modified_pairs();
+    modified_hunks(old, new, &pairs, cap)
+}
+
 /// Stable ordering helper for tests.
 pub fn edits_by_va(set: &PatchSet) -> BTreeMap<u64, &PatchEdit> {
     set.edits.iter().map(|e| (e.va, e)).collect()
@@ -407,5 +419,50 @@ mod tests {
             set.preview(&img),
             Err(PatchFault::OldBytesMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn hunks_from_modified_follows_diff_pairs() {
+        use crate::cfg::recover;
+        use crate::diff::{self, MatchKind};
+        use crate::model::load;
+        use crate::pe::tests::synthetic_pe64;
+
+        const MOV_1: &[u8] = &[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3];
+        const MOV_2: &[u8] = &[0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3];
+
+        fn pe_with(code: &[u8]) -> Vec<u8> {
+            let mut img = synthetic_pe64();
+            let opt = 0x80 + 4 + 20;
+            let dirs = opt + 112;
+            img[dirs + 8..dirs + 16].fill(0);
+            img[opt + 16..opt + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+            let off = 0x200;
+            img[off..off + code.len()].copy_from_slice(code);
+            img
+        }
+
+        let old_bytes = pe_with(MOV_1);
+        let new_bytes = pe_with(MOV_2);
+        let old_image = load(&old_bytes).expect("old loads");
+        let new_image = load(&new_bytes).expect("new loads");
+        let old_program = recover(old_image.as_ref()).expect("old recovers");
+        let new_program = recover(new_image.as_ref()).expect("new recovers");
+        let d = diff::diff(
+            old_image.as_ref(),
+            &old_program,
+            new_image.as_ref(),
+            &new_program,
+        );
+        assert_eq!(d.modified_pairs().len(), 1);
+        assert!(
+            d.of_kind("modified")
+                .iter()
+                .all(|p| p.kind == MatchKind::Modified)
+        );
+        let hunks = hunks_from_modified(old_image.as_ref(), new_image.as_ref(), &d, 6);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_prefix, MOV_1);
+        assert_eq!(hunks[0].new_prefix, MOV_2);
     }
 }

@@ -1478,7 +1478,8 @@ fn a64_defs(ins: &aarch64::Instruction) -> u32 {
         | O::DupElemScalar { .. }
         | O::DupElemVec { .. }
         | O::InsGp { .. }
-        | O::InsElem { .. } => 0,
+        | O::InsElem { .. }
+        | O::SimdAlu { .. } => 0,
         O::FcvtFromFp { rd, .. } | O::Umov { rd, .. } | O::Smov { rd, .. } => bit(rd),
         // Exclusives address with no writeback; the exclusive store also
         // defines its status register.

@@ -309,6 +309,16 @@ impl Diff {
                 .values()
                 .all(|pair| pair.kind == MatchKind::Unchanged)
     }
+
+    /// `(old_entry, new_entry)` for every confident [`MatchKind::Modified`]
+    /// pair, in old-entry order. Suitable input for
+    /// [`crate::patch::modified_hunks`] / [`crate::patch::hunks_from_modified`].
+    pub fn modified_pairs(&self) -> Vec<(u64, u64)> {
+        self.of_kind("modified")
+            .into_iter()
+            .filter_map(|pair| pair.new_entry.map(|new| (pair.old_entry, new)))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -794,10 +794,10 @@ mod tests {
 
     #[test]
     fn an_unknown_aarch64_word_lifts_to_an_intrinsic_not_a_truncation() {
-        // A vector-ALU word (orr.16b) decodes as Unknown and lifts to the
+        // An LSE atomic (ldaddal) decodes as Unknown and lifts to the
         // sound clobber-everything intrinsic — coverage, not correctness,
         // is what is partial, so the walk continues to the ret.
-        let img = a64_image(&[0x4EA1_1C21, RET]);
+        let img = a64_image(&[0xF8E9_0108, RET]);
         let func = raw_function(BASE, BASE + 8);
         let lifted = lift_function(&img, &func).expect("aarch64 lifts");
         let block = &lifted.blocks[&BASE];
@@ -805,6 +805,37 @@ mod tests {
         assert_eq!(ir::check(&block.stmts), Ok(()));
         assert!(
             block
+                .stmts
+                .iter()
+                .any(|s| matches!(s, ir::Stmt::Intrinsic { name, .. } if *name == "a64.unknown")),
+            "{:?}",
+            block.stmts
+        );
+    }
+
+    #[test]
+    fn a_simd_alu_word_lifts_into_the_ssa_path() {
+        // orr v1.16b + ret: precise Or over the vector cells, no
+        // a64.unknown clobber, block continues.
+        let img = a64_image(&[0x4EA1_1C21, RET]);
+        let func = raw_function(BASE, BASE + 8);
+        let lifted = lift_function(&img, &func).expect("aarch64 lifts");
+        let block = &lifted.blocks[&BASE];
+        assert!(!block.truncated);
+        assert_eq!(ir::check(&block.stmts), Ok(()));
+        assert!(
+            block.stmts.iter().any(|s| matches!(
+                s,
+                ir::Stmt::Assign {
+                    value: ir::Expr::Binary { op: ir::BinOp::Or, .. },
+                    ..
+                }
+            )),
+            "{:?}",
+            block.stmts
+        );
+        assert!(
+            !block
                 .stmts
                 .iter()
                 .any(|s| matches!(s, ir::Stmt::Intrinsic { name, .. } if *name == "a64.unknown")),

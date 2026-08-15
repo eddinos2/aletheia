@@ -1,21 +1,37 @@
 # Aletheia
 
-**Clean-room binary analysis in Rust** — loaders, disassembly, recovery, and an
-early decompiler path. Built for security research, malware analysis,
-vulnerability work, interoperability, and teaching.
+**Open-source binary analysis for researchers** — a clean-room Rust toolkit
+for disassembly, recovery, decompilation, surgical patch/diff, and
+**agent-driven reverse-engineering workflows**.
 
-Named after Greek *aletheia*: truth as what is brought out of concealment.
-That is the point of the tool.
+Named after Greek *aletheia*: truth brought out of concealment.
 
-Aletheia sits in the open tradition of [Ghidra](https://ghidra-sre.org/),
-[radare2](https://rada.re/), and [Rizin](https://rizin.re/). Everything is
-written from **public specs** (PE/COFF, ELF gABI, Intel SDM, Arm ARM) — not
-from proprietary tool internals.
+## Why this exists
 
-> Early project. The API will move. What is here aims to be solid: bounds-checked
-> parsers, typed errors, deterministic analysis, and tests. See [ROADMAP.md](ROADMAP.md).
+Commercial reverse-engineering suites are powerful and expensive. Many
+labs, students, and indie researchers hit a wall: locked databases,
+awkward headless/automation, and tooling that was never designed for
+AI agents. Aletheia is the opposite bet:
 
-## Status (honest)
+- **Open source** (MIT OR Apache-2.0) — no license wall for research.
+- **Library-first + MCP** — plug into Cursor, Claude, or any agent to
+  automate triage, rename, decompile, diff, and patch preview.
+- **Deterministic & parallel** — same binary, same result, any thread count.
+- **Git-native annotations** — your work is a text log you can PR, not a
+  proprietary opaque database.
+- **Honest analysis** — proven vs heuristic is visible; no silent guessing.
+
+The long-term bar is simple: **match or beat closed suites where it
+matters for modern research** (headless, agents, collaboration, Go/Rust,
+patch/diff) while staying clean-room and open.
+
+## Keywords
+
+`reverse-engineering` · `disassembler` · `decompiler` · `binary-analysis` ·
+`malware-analysis` · `vulnerability-research` · `patch-diffing` · `MCP` ·
+`AI-agents` · `Rust` · `PE` · `ELF` · `Mach-O` · `AArch64` · `x86-64`
+
+## What works today
 
 | Area | State |
 |---|---|
@@ -24,42 +40,54 @@ from proprietary tool internals.
 | CFG, functions, xrefs, strings, jumptables | Working |
 | Parallel analysis (deterministic) | Working |
 | Open annotation DB (git-friendly) | Working |
-| IR → SSA → structure → `--decompile` | Working, readability still deepening |
+| IR → SSA → structure → `--decompile` | Working; readability deepening |
 | Go / Rust / C++ recoveries | Present, uneven depth |
 | PatchSet preview / sibling apply | Early |
-| MCP server (`aletheia-mcp`) | Early skeleton |
+| MCP server (`aletheia-mcp`) | Early — agent entry point |
 | GUI | Spec + mockup only |
 
 ```console
-$ cargo run --bin redump -- program.exe
+$ cargo run --bin redump -- ./target
 $ cargo run --bin redump -- ./a.out --listing
 $ cargo run --bin redump -- ./app --decompile=4
 $ cargo run --bin redump -- old.bin --diff new.bin
+$ cargo run -p aletheia-mcp
 ```
 
-## Design bets
+Agent loop (MCP): `open` → `decompile` / `diff` / `patch_preview` → annotate.
 
-1. **Library first** — CLI and future UI are thin clients.
-2. **Hostile input is normal** — malware and broken files; no panics on garbage.
-3. **Parallel by construction** — same binary → same result at any thread count.
-4. **Open, diffable annotations** — asserted facts in a documented format.
+## Design principles
+
+1. **Library first** — CLI, MCP, and future UI are thin clients.
+2. **Hostile input is normal** — malware and broken files; typed errors, no panics.
+3. **Parallel by construction** — analysis scales across cores by design.
+4. **Open, diffable annotations** — asserted facts only; computed facts regenerate.
 5. **Zero mandatory deps** in the core crate.
-6. **Clean-room, always** — see [CONTRIBUTING.md](CONTRIBUTING.md).
+6. **Clean-room** — public specs only. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Build
 
 ```console
-$ cargo build
-$ cargo test
+$ cargo build --workspace
+$ cargo test --workspace
 $ cargo clippy --workspace --all-targets
 ```
 
-Stable Rust, edition 2024.
+Requires stable Rust (edition 2024).
 
 ## License
 
-MIT OR Apache-2.0.
+Dual-licensed under **MIT OR Apache-2.0**, at your option.
 
-## Author
+- [LICENSE-MIT](LICENSE-MIT)
+- [LICENSE-APACHE](LICENSE-APACHE)
 
-Maintained by [eddinos2](https://github.com/eddinos2).
+See [LICENSE](LICENSE) for the short form.
+
+## Maintainer
+
+[eddinos2](https://github.com/eddinos2)
+
+## Roadmap
+
+High-level plan and phase status: [ROADMAP.md](ROADMAP.md).

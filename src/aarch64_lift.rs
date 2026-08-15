@@ -43,13 +43,17 @@
 //! the lower address); only `FMOV Vd.D[1], Xn` writes a half in
 //! isolation. Register 31 is `V31` — the file has no ZR/SP. The
 //! `a64.unknown` clobber now covers all 64 vector cells too, so the
-//! unmodeled remainder (the Advanced SIMD vector ALU) stays sound.
+//! unmodeled remainder (remaining Advanced SIMD vector ALU beyond the
+//! three-same integer slice, LSE atomics, SVE, …) stays sound.
 //! Scalar FP *arithmetic* lifts to precise named intrinsics over these
 //! cells — `a64.fadd` writes exactly `vlo(rd)` and reads its two
 //! operand cells, `a64.fcmp` writes exactly the four NZCV flags — so
 //! FP dataflow keeps real def-use chains even where the operation
 //! itself is opaque; every scalar FP write is followed by the
-//! architectural `vhi := 0`. `callfx`'s AAPCS64 summary covers the
+//! architectural `vhi := 0`. The three-same integer ALU lifts bitwise
+//! AND/ORR/EOR (and `.2d` ADD/SUB) exactly over the two 64-bit cells;
+//! packed ADD/SUB of narrower lanes uses a precise named intrinsic
+//! writing the destination halves. `callfx`'s AAPCS64 summary covers the
 //! vector file both directions: v0–v7/v16–v31 and the high halves of
 //! v8–v15 clobbered (only the bottom 64 bits of v8–v15 are
 //! callee-saved), v0–v7 read as arguments and live-out as the return
@@ -101,8 +105,8 @@
 //!   execute as `NOP` by definition) to nothing.
 //! - **[`Opcode::Unknown`]** lifts to a single clobber-everything intrinsic
 //!   writing all 32 GPR/SP cells, all 64 SIMD&FP half cells, and all four
-//!   NZCV flags — sound for the unmodeled remainder (the Advanced SIMD
-//!   vector ALU, LSE atomics, SVE, …).
+//!   NZCV flags — sound for the unmodeled remainder (remaining Advanced
+//!   SIMD vector ALU, LSE atomics, SVE, …).
 //! - **Temporaries** are numbered per lifted instruction from 0;
 //!   [`lift_block`] threads one monotonic counter across a block so a later
 //!   instruction can never read an earlier one's temporary.
@@ -539,6 +543,50 @@ fn fp_scalar_intr(name: &'static str, rdn: u8, reads: Vec<Expr>) -> Vec<Stmt> {
         },
         assign(vhi(rdn), k(0, Width::W64)),
     ]
+}
+
+/// Advanced SIMD three-same integer ALU over the two 64-bit cells.
+/// Bitwise AND/ORR/EOR and `.2d` ADD/SUB are exact; packed ADD/SUB of
+/// narrower lanes is a precise named intrinsic. `Q = 0` zeroes the
+/// high half architecturally.
+fn simd_alu(op: aarch64::SimdAluOp, q: bool, size: u8, rdn: u8, rn: u8, rm: u8) -> Vec<Stmt> {
+    use aarch64::SimdAluOp;
+    let exact = match op {
+        SimdAluOp::And => Some(BinOp::And),
+        SimdAluOp::Orr => Some(BinOp::Or),
+        SimdAluOp::Eor => Some(BinOp::Xor),
+        SimdAluOp::Add if size == 3 => Some(BinOp::Add),
+        SimdAluOp::Sub if size == 3 => Some(BinOp::Sub),
+        _ => None,
+    };
+    if let Some(bop) = exact {
+        let mut out = vec![assign(
+            vlo(rdn),
+            bin(bop, rd(vlo(rn)), rd(vlo(rm))),
+        )];
+        if q {
+            out.push(assign(vhi(rdn), bin(bop, rd(vhi(rn)), rd(vhi(rm)))));
+        } else {
+            out.push(assign(vhi(rdn), k(0, Width::W64)));
+        }
+        return out;
+    }
+    let name = match op {
+        SimdAluOp::Add => "a64.vadd",
+        SimdAluOp::Sub => "a64.vsub",
+        _ => unreachable!("logical and .2d are exact"),
+    };
+    let mut reads = vec![rd(vlo(rn)), rd(vlo(rm))];
+    let mut writes = vec![vlo(rdn)];
+    if q {
+        reads.extend([rd(vhi(rn)), rd(vhi(rm))]);
+        writes.push(vhi(rdn));
+    }
+    let mut out = vec![Stmt::Intrinsic { name, writes, reads }];
+    if !q {
+        out.push(assign(vhi(rdn), k(0, Width::W64)));
+    }
+    out
 }
 
 /// The intrinsic name of a scalar FP two-source operation.
@@ -2216,6 +2264,14 @@ fn lift_with(insn: &aarch64::Instruction, va: u64, temp: &mut u16) -> Vec<Stmt> 
             let elem = velem(size, src, rn);
             ctx.ins_elem(rdn, size, dst, elem)
         }
+        Opcode::SimdAlu {
+            op,
+            q,
+            size,
+            rd: rdn,
+            rn,
+            rm,
+        } => simd_alu(op, q, size, rdn, rn, rm),
 
         // ---- exclusives and ordered accesses ----
         // Acquire/release ordering has no single-threaded content; the
@@ -3815,8 +3871,9 @@ mod tests {
 
     #[test]
     fn unknown_clobbers_every_cell_and_flag() {
-        // A vector-ALU word (orr.16b — the recorded remaining ceiling).
-        let s = lift_word(0x4EA1_1C21);
+        // An LSE atomic (ldaddal — a documented gap) takes the
+        // clobber-everything fallback, carrying its raw word.
+        let s = lift_word(0xF8E9_0108);
         assert_eq!(ir::check(&s), Ok(()));
         let [Stmt::Intrinsic { name, writes, reads }] = s.as_slice() else {
             panic!("expected a single intrinsic");
@@ -3825,15 +3882,66 @@ mod tests {
         // 32 GPR/SP cells + 64 SIMD&FP half cells + 4 NZCV flags.
         assert_eq!(writes.len(), 100);
         assert!(writes.contains(&vlo(0)) && writes.contains(&vhi(31)));
-        assert_eq!(reads.as_slice(), [k(0x4EA1_1C21, Width::W64)]);
-        // An LSE atomic (ldaddal — a documented gap) takes the same
-        // fallback, carrying its raw word.
-        let s = lift_word(0xF8E9_0108);
+        assert_eq!(reads.as_slice(), [k(0xF8E9_0108, Width::W64)]);
+    }
+
+    #[test]
+    fn simd_three_same_alu_lifts_exact_bitwise_and_precise_add() {
+        // orr v1.16b, v1.16b, v1.16b — exact Or over both halves.
+        let s = lift_word(0x4EA1_1C21);
+        assert_eq!(ir::check(&s), Ok(()));
+        assert_eq!(
+            s.as_slice(),
+            [
+                assign(vlo(1), bin(BinOp::Or, rd(vlo(1)), rd(vlo(1)))),
+                assign(vhi(1), bin(BinOp::Or, rd(vhi(1)), rd(vhi(1)))),
+            ]
+        );
+        // and v0.8b, v1.8b, v2.8b — Q = 0 zeroes the high half.
+        let s = lift_word(0x0E22_1C20);
+        assert_eq!(ir::check(&s), Ok(()));
+        assert_eq!(
+            s.as_slice(),
+            [
+                assign(vlo(0), bin(BinOp::And, rd(vlo(1)), rd(vlo(2)))),
+                assign(vhi(0), k(0, Width::W64)),
+            ]
+        );
+        // eor v0.16b, v1.16b, v2.16b
+        let s = lift_word(0x6E22_1C20);
         assert!(matches!(
             s.as_slice(),
-            [Stmt::Intrinsic { name: "a64.unknown", reads, .. }]
-                if reads.as_slice() == [k(0xF8E9_0108, Width::W64)]
+            [
+                Stmt::Assign { dst, .. },
+                Stmt::Assign { .. }
+            ] if *dst == vlo(0)
         ));
+        assert!(s.iter().any(|st| matches!(
+            st,
+            Stmt::Assign { value: Expr::Binary { op: BinOp::Xor, .. }, .. }
+        )));
+        // sub v0.2d, v1.2d, v2.2d — exact Sub on each half.
+        let s = lift_word(0x6EE2_8420);
+        assert_eq!(ir::check(&s), Ok(()));
+        assert_eq!(
+            s.as_slice(),
+            [
+                assign(vlo(0), bin(BinOp::Sub, rd(vlo(1)), rd(vlo(2)))),
+                assign(vhi(0), bin(BinOp::Sub, rd(vhi(1)), rd(vhi(2)))),
+            ]
+        );
+        // add v0.4s, v1.4s, v2.4s — packed; precise intrinsic.
+        let s = lift_word(0x4EA2_8420);
+        assert_eq!(ir::check(&s), Ok(()));
+        let [Stmt::Intrinsic { name, writes, reads }] = s.as_slice() else {
+            panic!("expected a64.vadd intrinsic, got {s:?}");
+        };
+        assert_eq!(*name, "a64.vadd");
+        assert_eq!(writes.as_slice(), [vlo(0), vhi(0)]);
+        assert_eq!(
+            reads.as_slice(),
+            [rd(vlo(1)), rd(vlo(2)), rd(vhi(1)), rd(vhi(2))]
+        );
     }
 
     // ---- scalar FP arithmetic: precise intrinsics, never the clobber ----
@@ -4333,8 +4441,8 @@ mod tests {
         0xDAC0_016A, 0x5AC0_09AC, 0xDAC0_0DEE, 0x5AC0_0630, 0xDAC0_0672,
         0xDAC0_0AB4, 0x1382_1420, 0x93C5_8483, 0x1387_24E6, 0x93C9_8128,
         0x6941_0440, 0x69FF_90A3, 0x68C2_1D06,
-        // unmodeled space: a vector-ALU word, an LSE atomic, SVE.
-        0x4EA1_1C21, 0xF8E9_0108, 0x0420_0000,
+        // three-same integer ALU (modeled) plus unmodeled LSE / SVE.
+        0x4EA1_1C21, 0x4EA2_8420, 0x6E22_1C20, 0xF8E9_0108, 0x0420_0000,
     ];
 
     #[test]

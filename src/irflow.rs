@@ -71,6 +71,15 @@
 //!   only: what finishes a pattern whose other flag already folded to a
 //!   constant — `cmp a, 0` folds `OF` to `0` outright, and `jl` must still
 //!   come out as `a <s 0`.
+//! - *Boolean merge* (setcc / `cset` / `cbnz` plumbing): a zero-extended
+//!   `W1` compared against zero recovers the bit
+//!   (`zext(c) != 0 → c`, `zext(c) == 0 → ~c`); a one-bit mask of a
+//!   sign-extended condition collapses the same way
+//!   (`1 & sext(c) → zext(c)`, `1 & ~sext(c) → zext(~c)`); and the full
+//!   branchless select `(k_t & m) | (k_f & ~m)` with `{k_t,k_f} ⊆ {0,1}`
+//!   and `m = sext(c)` is the `cset`/`csinc`-from-zr shape, folding to
+//!   `zext(c)` or `zext(~c)`. Conjunction of two such 0/1 values tested
+//!   against zero recovers `c₁ & c₂` at `W1`. No new IR operator.
 //! - The *masked* pair, behind a conditional compare:
 //!   [`crate::aarch64_lift`]'s CCMP writes each flag as the select
 //!   `(c & model) | (~c & bit)`, whose constant arm folds first, so a
@@ -604,6 +613,11 @@ fn fold_binary_identity(op: BinOp, lhs: &Expr, rhs: &Expr, vn: Option<&VnDefs>) 
             if lhs == rhs && !contains_load(lhs, 0) {
                 return Some(lhs.clone());
             }
+            // 1 & sext(c) / 1 & ~sext(c): the cset remnant after the
+            // zero arm of the select folded away (see "Boolean merge").
+            if let Some(s) = bool_mask_and(lhs, rhs) {
+                return Some(s);
+            }
             // (a != b) & (b <= a) → b < a (either signedness): the `jg` /
             // `ja` composition, once its flag halves have collapsed.
             if let Some(s) = and_order_compose(lhs, rhs, vn) {
@@ -622,6 +636,10 @@ fn fold_binary_identity(op: BinOp, lhs: &Expr, rhs: &Expr, vn: Option<&VnDefs>) 
             // x | x → x (load-free)
             if lhs == rhs && !contains_load(lhs, 0) {
                 return Some(lhs.clone());
+            }
+            // (k_t & m) | (k_f & ~m) with 0/1 arms: the full cset select.
+            if let Some(s) = bool_select_or(lhs, rhs) {
+                return Some(s);
             }
             // (a == b) | (a < b) → a <= b (either signedness): the `jle` /
             // `jbe` composition, once its flag halves have collapsed.
@@ -689,6 +707,11 @@ fn fold_binary_identity(op: BinOp, lhs: &Expr, rhs: &Expr, vn: Option<&VnDefs>) 
             // A `W1` comparison against a boolean constant, the pattern
             // remnant left when the other flag folded to a constant first.
             if let Some(s) = w1_const_compare(op, lhs, rhs) {
+                return Some(s);
+            }
+            // zext(c) != 0 → c, and (zext(a) & zext(b)) != 0 → a & b:
+            // setcc/cset then test/cbnz (see "Boolean merge").
+            if let Some(s) = zext_bool_compare(op, lhs, rhs) {
                 return Some(s);
             }
             None
@@ -860,6 +883,177 @@ fn w1_const_compare(cmp: BinOp, lhs: &Expr, rhs: &Expr) -> Option<Expr> {
                     .unwrap_or_else(|| Expr::unary(UnOp::Not, x.clone())),
             )
         };
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Boolean merge (setcc / cset / cbnz — see the module docs)
+// ---------------------------------------------------------------------------
+
+/// Peel a zero-extended `W1` boolean, or `None`.
+fn zext_w1(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Unary {
+            op: UnOp::ZeroExtend(_),
+            operand,
+        } if operand.width_of() == Some(Width::W1) => Some(operand),
+        _ => None,
+    }
+}
+
+/// Peel `sext(c)` for a `W1` `c`, or `None`.
+fn sext_w1(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Unary {
+            op: UnOp::SignExtend(_),
+            operand,
+        } if operand.width_of() == Some(Width::W1) => Some(operand),
+        _ => None,
+    }
+}
+
+/// `zext(c)` to `w` — the bit as a 0/1 of width `w`.
+fn zext_bool(c: &Expr, w: Width) -> Expr {
+    if w == Width::W1 {
+        c.clone()
+    } else {
+        Expr::unary(UnOp::ZeroExtend(w), c.clone())
+    }
+}
+
+/// `1 & sext(c) → zext(c)` and `1 & ~sext(c) → zext(~c)` at the And's
+/// width. Either operand order. The one-bit mask is exactly what a
+/// `cset` leaves after the zero select-arm folds away.
+fn bool_mask_and(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
+    for (one, masked) in [(lhs, rhs), (rhs, lhs)] {
+        if !is_const(one, 1) {
+            continue;
+        }
+        let w = masked.width_of()?;
+        // 1 & sext(c)
+        if let Some(c) = sext_w1(masked) {
+            return Some(zext_bool(c, w));
+        }
+        // 1 & ~sext(c)
+        if let Expr::Unary {
+            op: UnOp::Not,
+            operand,
+        } = masked
+            && let Some(c) = sext_w1(operand)
+        {
+            let flipped = fold_unary_identity(UnOp::Not, c, None)
+                .unwrap_or_else(|| Expr::unary(UnOp::Not, c.clone()));
+            return Some(zext_bool(&flipped, w));
+        }
+    }
+    None
+}
+
+/// `(k_t & m) | (k_f & ~m)` with `{k_t, k_f} ⊆ {0, 1}` and `m = sext(c)`:
+/// the full branchless `cset`/`csel`-from-constants shape. Either arm
+/// order of the `|`. Yields `zext(c)` or `zext(~c)` at the Or's width.
+fn bool_select_or(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
+    fn arm(e: &Expr) -> Option<(u64, &Expr)> {
+        let Expr::Binary {
+            op: BinOp::And,
+            lhs: a,
+            rhs: b,
+        } = e
+        else {
+            return None;
+        };
+        let a = a.as_ref();
+        let b = b.as_ref();
+        for (k, m) in [(a, b), (b, a)] {
+            let Some((v, _)) = const_value(k) else {
+                continue;
+            };
+            if v > 1 {
+                continue;
+            }
+            return Some((v, m));
+        }
+        None
+    }
+    for (t, f) in [(lhs, rhs), (rhs, lhs)] {
+        let Some((kt, mt)) = arm(t) else {
+            continue;
+        };
+        let Some((kf, mf)) = arm(f) else {
+            continue;
+        };
+        // One arm's mask must be the complement of the other's, and the
+        // un-complemented side is the sign-extended condition.
+        let (c, true_when) = if let Expr::Unary {
+            op: UnOp::Not,
+            operand,
+        } = mf
+            && operand.as_ref() == mt
+            && let Some(c) = sext_w1(mt)
+        {
+            (c, kt == 1)
+        } else if let Expr::Unary {
+            op: UnOp::Not,
+            operand,
+        } = mt
+            && operand.as_ref() == mf
+            && let Some(c) = sext_w1(mf)
+        {
+            (c, kf == 1)
+        } else {
+            continue;
+        };
+        let w = t.width_of().or_else(|| f.width_of())?;
+        let bit = if true_when {
+            c.clone()
+        } else {
+            fold_unary_identity(UnOp::Not, c, None)
+                .unwrap_or_else(|| Expr::unary(UnOp::Not, c.clone()))
+        };
+        return Some(zext_bool(&bit, w));
+    }
+    None
+}
+
+/// `zext(c) != 0 → c`, `zext(c) == 0 → ~c`, and the same over a
+/// conjunction of two zero-extended bits: `(zext(a) & zext(b)) != 0 →
+/// a & b`. Either orientation of the zero. Widths of the zexts may
+/// disagree with each other only when both are pure zext-of-W1 (the
+/// And's width is then well-defined as their shared result width).
+fn zext_bool_compare(cmp: BinOp, lhs: &Expr, rhs: &Expr) -> Option<Expr> {
+    if !matches!(cmp, BinOp::Eq | BinOp::Ne) {
+        return None;
+    }
+    for (x, z) in [(lhs, rhs), (rhs, lhs)] {
+        if !is_const(z, 0) {
+            continue;
+        }
+        // zext(c) ? 0
+        if let Some(c) = zext_w1(x) {
+            return Some(if cmp == BinOp::Ne {
+                c.clone()
+            } else {
+                fold_unary_identity(UnOp::Not, c, None)
+                    .unwrap_or_else(|| Expr::unary(UnOp::Not, c.clone()))
+            });
+        }
+        // (zext(a) & zext(b)) ? 0 — either And order already folded.
+        if let Expr::Binary {
+            op: BinOp::And,
+            lhs: a,
+            rhs: b,
+        } = x
+            && let (Some(ca), Some(cb)) = (zext_w1(a), zext_w1(b))
+        {
+            let conj = Expr::binary(BinOp::And, ca.clone(), cb.clone());
+            return Some(if cmp == BinOp::Ne {
+                conj
+            } else {
+                fold_unary_identity(UnOp::Not, &conj, None)
+                    .unwrap_or_else(|| Expr::unary(UnOp::Not, conj))
+            });
+        }
     }
     None
 }
@@ -2328,6 +2522,73 @@ mod tests {
         // A wider comparison against zero is not this identity.
         let wide = bin(BinOp::Ne, read(ra(0, Width::W8)), c(0, Width::W8));
         assert_eq!(fold_expr(&wide), wide);
+    }
+
+    #[test]
+    fn boolean_merge_folds_cset_select_and_zext_cbnz() {
+        // cset w0, eq ≈ (1 & sext(ZF)) | (0 & ~sext(ZF)) → zext(ZF).
+        let zf = read(Reg::flag(Flag::Zero));
+        let m = un(UnOp::SignExtend(Width::W32), zf.clone());
+        let select = bin(
+            BinOp::Or,
+            bin(BinOp::And, c(1, Width::W32), m.clone()),
+            bin(BinOp::And, c(0, Width::W32), un(UnOp::Not, m.clone())),
+        );
+        assert_eq!(
+            fold_expr(&select),
+            un(UnOp::ZeroExtend(Width::W32), zf.clone())
+        );
+        // The remnant after the zero arm folds: 1 & ~sext(ZF) → zext(~ZF).
+        let rem = bin(BinOp::And, c(1, Width::W32), un(UnOp::Not, m));
+        assert_eq!(
+            fold_expr(&rem),
+            un(UnOp::ZeroExtend(Width::W32), un(UnOp::Not, zf.clone()))
+        );
+        // cbnz over a setcc/cset: zext(ZF) != 0 → ZF.
+        let zext = un(UnOp::ZeroExtend(Width::W64), zf.clone());
+        assert_eq!(
+            fold_expr(&bin(BinOp::Ne, zext.clone(), c(0, Width::W64))),
+            zf.clone()
+        );
+        assert_eq!(
+            fold_expr(&bin(BinOp::Eq, zext, c(0, Width::W64))),
+            un(UnOp::Not, zf.clone())
+        );
+        // (zext(a) & zext(b)) != 0 → a & b — two setccs then test.
+        let sf = read(Reg::flag(Flag::Sign));
+        let conj = bin(
+            BinOp::And,
+            un(UnOp::ZeroExtend(Width::W8), zf.clone()),
+            un(UnOp::ZeroExtend(Width::W8), sf.clone()),
+        );
+        assert_eq!(
+            fold_expr(&bin(BinOp::Ne, conj, c(0, Width::W8))),
+            bin(BinOp::And, zf, sf)
+        );
+    }
+
+    #[test]
+    fn boolean_merge_refuses_near_misses() {
+        let zf = read(Reg::flag(Flag::Zero));
+        // Non-0/1 select arms must not collapse to a boolean.
+        let both_live = bin(
+            BinOp::Or,
+            bin(BinOp::And, c(2, Width::W32), un(UnOp::SignExtend(Width::W32), zf.clone())),
+            bin(
+                BinOp::And,
+                c(3, Width::W32),
+                un(UnOp::Not, un(UnOp::SignExtend(Width::W32), zf)),
+            ),
+        );
+        let folded = fold_expr(&both_live);
+        assert!(
+            matches!(folded, Expr::Binary { op: BinOp::Or, .. }),
+            "non-0/1 select arms must not collapse to a boolean: {folded:?}"
+        );
+        // A wider value zero-extended is not a W1 boolean.
+        let wide = un(UnOp::ZeroExtend(Width::W64), read(ra(0, Width::W8)));
+        let e = bin(BinOp::Ne, wide.clone(), c(0, Width::W64));
+        assert_eq!(fold_expr(&e), e);
     }
 
     #[test]

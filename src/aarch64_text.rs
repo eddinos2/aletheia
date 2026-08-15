@@ -1086,8 +1086,10 @@ mod tests {
 
     #[test]
     fn unmodeled_encodings_render_nothing() {
-        // UDF #0, a SIMD word, a logical immediate, an extract, a system
-        // register write, and a load-exclusive.
+        // UDF #0, a SIMD ALU word (decoder covers it; this text renderer
+        // deliberately does not — listing text is a separate increment),
+        // a logical immediate, an extract, a system register write, and
+        // a load-exclusive.
         for w in [
             0x0000_0000u32,
             0x4EA1_1C21,

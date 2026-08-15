@@ -2390,7 +2390,7 @@ mod tests {
 
     /// An aarch64 diamond built from real lifted words: a `cbz` guard, an
     /// arm holding a modeled `add` plus an `Unknown` word's clobber
-    /// intrinsic, and a `ret` join.
+    /// intrinsic (LSE atomic), and a `ret` join.
     ///
     /// ```text
     /// 1000  cbz x0, 1010
@@ -2404,7 +2404,7 @@ mod tests {
                 block(0x1000, a64_stmts(&[0xB400_0080], 0x1000), vec![0x1010, 0x1004]),
                 block(
                     0x1004,
-                    a64_stmts(&[0x9100_0400, 0x4EA1_1C21], 0x1004),
+                    a64_stmts(&[0x9100_0400, 0xF8E9_0108], 0x1004),
                     vec![0x1010],
                 ),
                 block(0x1010, a64_stmts(&[0xD65F_03C0], 0x1010), vec![]),

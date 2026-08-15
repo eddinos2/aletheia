@@ -7,6 +7,17 @@ name = "aletheia"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Clean-room binary-analysis toolkit: loaders, disassembly, and program analysis"
+description = "Open-source binary analysis: decompile, patch-diff, and agent/MCP automation for reverse-engineering research"
+repository = "https://github.com/eddinos2/aletheia"
+homepage = "https://github.com/eddinos2/aletheia"
+readme = "README.md"
+keywords = [
+    "reverse-engineering",
+    "decompiler",
+    "disassembler",
+    "binary-analysis",
+    "mcp",
+]
+categories = ["development-tools", "parsing"]
 
 [dependencies]

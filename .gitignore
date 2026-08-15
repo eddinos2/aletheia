@@ -3,3 +3,6 @@
 .DS_Store
 **/.DS_Store
 *.patched
+
+# Slice plans are local engineering notes — not part of the public tree.
+PLAN_*.md

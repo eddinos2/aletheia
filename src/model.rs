@@ -276,9 +276,9 @@ pub trait Image {
     ///   included in this pass).
     /// - ELF: GOT slots from the PLT relocation table joined to dynamic
     ///   symbol names ([`elf::ElfFile::plt_imports`]).
-    /// - Mach-O: chained-fixup import *names* when
-    ///   `LC_DYLD_CHAINED_FIXUPS` is present (slot VAs still require a
-    ///   full chain walk — names-only until that slice); empty otherwise.
+    /// - Mach-O: chained-fixup bind slots when `LC_DYLD_CHAINED_FIXUPS`
+    ///   is present and a pointer-chain walk resolves them (real
+    ///   `slot_va`); empty when the command is absent or no binds walk.
     fn import_slots(&self) -> Vec<ImportSlot>;
 
     /// Map a virtual address to an offset into [`Image::bytes`].
@@ -724,19 +724,15 @@ impl Image for MachImage<'_> {
     }
 
     fn import_slots(&self) -> Vec<ImportSlot> {
-        // Full GOT/stub VA resolution needs a chain walk (next slice).
-        // When chained fixups are present we still surface named imports
-        // at VA 0 as placeholders so tooling can see the name table —
-        // consumers that require a real slot VA must wait for the walk.
         let Some(cf) = &self.mach.chained_fixups else {
             return Vec::new();
         };
-        cf.import_names
+        cf.bind_slots
             .iter()
-            .filter(|n| !n.is_empty())
-            .map(|name| ImportSlot {
-                slot_va: 0,
-                name: name.clone(),
+            .filter(|s| !s.name.is_empty())
+            .map(|s| ImportSlot {
+                slot_va: s.slot_va,
+                name: s.name.clone(),
             })
             .collect()
     }
@@ -980,7 +976,7 @@ mod tests {
                 },
             ]
         );
-        assert!(v.slots.is_empty()); // bind opcodes deferred
+        assert!(v.slots.is_empty()); // no chained fixups in the fixture
 
         assert_eq!(
             mach.va_to_offset(MACH_TEXT + MACH_ENTRYOFF),

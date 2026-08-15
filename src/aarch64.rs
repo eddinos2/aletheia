@@ -47,6 +47,9 @@
 //! - **Element moves**: `DUP` (general, element→vector, and the scalar
 //!   `mov d0, v1.d[1]` form), `INS` (general and element),
 //!   `UMOV`/`SMOV`.
+//! - **Advanced SIMD three-same integer ALU**: `ADD`/`SUB`/`AND`/`ORR`/
+//!   `EOR` vector forms (byte through double for ADD/SUB; the logical
+//!   trio always on `.8b`/`.16b`).
 //! - **Exclusives / ordered**: `LDAR`/`STLR`, `LDXR`/`LDAXR`,
 //!   `STXR`/`STLXR`, every size.
 //! - **Pointer authentication and UDF**: `RETAA`/`RETAB`, the
@@ -61,13 +64,13 @@
 //!   an unmodeled word can never desynchronize the instruction stream —
 //!   it is reported as undecoded rather than guessed at.
 //!
-//! Known gaps (all decode as `Unknown` / `Sequential`): the Advanced
-//! SIMD vector ALU (three-same, two-reg-misc, shift-immediate,
-//! across-lanes, permutes), the structure loads/stores (`LD1`/`ST1`/...),
-//! LSE atomics (`LDADD`/`SWP`/`CAS`...), the D-key PAC data ops,
-//! `ERET`/`DRPS`, half precision, `PRFM`, the unprivileged
-//! `LDTR`/`STTR` forms, fixed-point converts (`FCVTZS` with a scale),
-//! and CRC32.
+//! Known gaps (all decode as `Unknown` / `Sequential`): the remaining
+//! Advanced SIMD vector ALU (two-reg-misc, shift-immediate, across-lanes,
+//! permutes, compares, the BIC/ORN/BSL siblings), the structure
+//! loads/stores (`LD1`/`ST1`/...), LSE atomics (`LDADD`/`SWP`/`CAS`...),
+//! the D-key PAC data ops, `ERET`/`DRPS`, half precision, `PRFM`, the
+//! unprivileged `LDTR`/`STTR` forms, fixed-point converts (`FCVTZS` with
+//! a scale), and CRC32.
 
 use crate::error::{ParseError, Result};
 use std::fmt;
@@ -284,6 +287,31 @@ impl F2Op {
             F2Op::MaxNm => "fmaxnm",
             F2Op::MinNm => "fminnm",
             F2Op::NMul => "fnmul",
+        }
+    }
+}
+
+/// Advanced SIMD three-same integer ALU (the public ADD/SUB/AND/ORR/EOR
+/// vector forms). Element size is log2 bytes for ADD/SUB; the logical
+/// trio always operates on bytes (`.8b`/`.16b` by `Q`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdAluOp {
+    Add,
+    Sub,
+    And,
+    Orr,
+    Eor,
+}
+
+impl SimdAluOp {
+    /// Assembler mnemonic.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SimdAluOp::Add => "add",
+            SimdAluOp::Sub => "sub",
+            SimdAluOp::And => "and",
+            SimdAluOp::Orr => "orr",
+            SimdAluOp::Eor => "eor",
         }
     }
 }
@@ -1006,6 +1034,18 @@ pub enum Opcode {
         src: u8,
         rd: u8,
         rn: u8,
+    },
+    /// Advanced SIMD three-same integer ALU: `ADD`/`SUB`/`AND`/`ORR`/`EOR`
+    /// vector forms. `size` is the element log2 width for ADD/SUB; the
+    /// logical ops ignore it (always byte lanes). `q` selects 64- vs
+    /// 128-bit vectors.
+    SimdAlu {
+        op: SimdAluOp,
+        q: bool,
+        size: u8,
+        rd: u8,
+        rn: u8,
+        rm: u8,
     },
     /// `LDAR{,B,H} <Rt>, [<Xn|SP>]`: load-acquire. `size` is the access
     /// log2 width (0/1/2/3).
@@ -1996,11 +2036,12 @@ fn decode_load_store_simd(w: u32, va: u64) -> Opcode {
     Opcode::Unknown(w)
 }
 
-/// Scalar FP and Advanced SIMD data processing (`op0 == x111`): only the
-/// move mass — `FMOV` in its register, general, and immediate forms, and
-/// the `MOVI`/`MVNI` modified immediates. Everything else in the space
-/// (all FP/vector arithmetic and conversions, the half-precision moves,
-/// the vector `ORR`/`BIC` immediates) is [`Opcode::Unknown`].
+/// Scalar FP and Advanced SIMD data processing (`op0 == x111`): the
+/// move mass (`FMOV`/`MOVI`/`MVNI`), scalar FP arithmetic, element
+/// moves, and the Advanced SIMD three-same integer ALU slice
+/// (`ADD`/`SUB`/`AND`/`ORR`/`EOR`). Everything else in the space
+/// (remaining vector ALU, structure loads/stores, half precision, the
+/// vector `ORR`/`BIC` immediates) is [`Opcode::Unknown`].
 fn decode_simd_fp(w: u32) -> Opcode {
     let rd = bits(w, 4, 0) as u8;
     let rn = bits(w, 9, 5) as u8;
@@ -2360,6 +2401,37 @@ fn decode_simd_fp(w: u32) -> Opcode {
                 rd,
             },
             _ => Opcode::Unknown(w),
+        };
+    }
+    // Advanced SIMD three-same integer ALU (public Arm ARM encodings):
+    // 0 Q U 01110 size 1 Rm opcode 1 Rn Rd — ADD/SUB (opcode 10000) and
+    // AND/ORR/EOR (opcode 00011; size discriminates the logical op).
+    if w & 0x9F20_0400 == 0x0E20_0400 {
+        let q = bit(w, 30);
+        let u = bit(w, 29);
+        let size = bits(w, 23, 22) as u8;
+        let opcode = bits(w, 15, 11);
+        let rm = bits(w, 20, 16) as u8;
+        let op = match (u, size, opcode) {
+            (false, _, 0b10000) if size < 3 || q => SimdAluOp::Add,
+            (true, _, 0b10000) if size < 3 || q => SimdAluOp::Sub,
+            // Logical: size selects the op; arrangement is always .8b/.16b.
+            (false, 0b00, 0b00011) => SimdAluOp::And,
+            (false, 0b10, 0b00011) => SimdAluOp::Orr,
+            (true, 0b00, 0b00011) => SimdAluOp::Eor,
+            _ => return Opcode::Unknown(w),
+        };
+        let elem = match op {
+            SimdAluOp::And | SimdAluOp::Orr | SimdAluOp::Eor => 0,
+            _ => size,
+        };
+        return Opcode::SimdAlu {
+            op,
+            q,
+            size: elem,
+            rd,
+            rn,
+            rm,
         };
     }
     Opcode::Unknown(w)
@@ -3769,6 +3841,21 @@ impl fmt::Display for Instruction {
                 let t = elem_type(size);
                 write!(f, "ins v{rd}.{t}[{dst}], v{rn}.{t}[{src}]")
             }
+            Opcode::SimdAlu {
+                op,
+                q,
+                size,
+                rd,
+                rn,
+                rm,
+            } => write!(
+                f,
+                "{} v{rd}.{}, v{rn}.{}, v{rm}.{}",
+                op.as_str(),
+                vec_arrangement(size, q),
+                vec_arrangement(size, q),
+                vec_arrangement(size, q)
+            ),
             Opcode::Ldar { size, rt, rn } => {
                 let (sfx, r) = ls_reg(size, rt);
                 write!(f, "ldar{sfx} {r}, {}", fmt_mem(rn, AddrMode::Offset(0)))
@@ -5379,14 +5466,63 @@ mod tests {
 
     #[test]
     fn unmodeled_encodings_are_unknown_and_sequential() {
-        // A vector-ALU word (ORR .16b), an LSE atomic (LDADDAL), and an
-        // SVE word: the recorded remaining ceiling.
-        for w in [0x4EA1_1C21u32, 0xF8E9_0108, 0x0420_0000] {
+        // An LSE atomic (LDADDAL) and an SVE word: the remaining ceiling
+        // after the three-same integer ALU slice.
+        for w in [0xF8E9_0108u32, 0x0420_0000] {
             let i = ins(w, VA);
             assert_eq!(i.opcode, Opcode::Unknown(w));
             assert_eq!(i.flow, Flow::Sequential);
             assert_eq!(i.to_string(), format!(".inst {w:#010x}"));
         }
+    }
+
+    #[test]
+    fn simd_three_same_integer_alu_decodes() {
+        // orr v1.16b, v1.16b, v1.16b — the former unknown ceiling word.
+        let i = ins(0x4EA1_1C21, VA);
+        assert_eq!(
+            i.opcode,
+            Opcode::SimdAlu {
+                op: SimdAluOp::Orr,
+                q: true,
+                size: 0,
+                rd: 1,
+                rn: 1,
+                rm: 1
+            }
+        );
+        assert_eq!(i.to_string(), "orr v1.16b, v1.16b, v1.16b");
+        // and v0.16b, v1.16b, v2.16b
+        assert_eq!(
+            ins(0x4E22_1C20, VA).opcode,
+            Opcode::SimdAlu {
+                op: SimdAluOp::And,
+                q: true,
+                size: 0,
+                rd: 0,
+                rn: 1,
+                rm: 2
+            }
+        );
+        // eor v0.8b, v1.8b, v2.8b
+        assert_eq!(
+            ins(0x2E22_1C20, VA).to_string(),
+            "eor v0.8b, v1.8b, v2.8b"
+        );
+        // add v0.4s, v1.4s, v2.4s
+        assert_eq!(
+            ins(0x4EA2_8420, VA).to_string(),
+            "add v0.4s, v1.4s, v2.4s"
+        );
+        // sub v0.2d, v1.2d, v2.2d
+        assert_eq!(
+            ins(0x6EE2_8420, VA).to_string(),
+            "sub v0.2d, v1.2d, v2.2d"
+        );
+        // add .2d with Q = 0 is reserved → Unknown.
+        assert_eq!(ins(0x0EE2_8420, VA).opcode, Opcode::Unknown(0x0EE2_8420));
+        // BIC (size=01 logical) stays Unknown this slice.
+        assert_eq!(ins(0x4E61_1C21, VA).opcode, Opcode::Unknown(0x4E61_1C21));
     }
 
     // Every FP-arithmetic golden word below was produced by assembling

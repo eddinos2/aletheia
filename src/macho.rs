@@ -29,10 +29,12 @@
 //! Deliberately out of scope for now (rejected or ignored, never
 //! mis-parsed): 32-bit images (`MH_MAGIC`), big-endian thin images
 //! (`MH_CIGAM_64`, historical PowerPC), classic dyld bind/rebase
-//! opcodes (non-chained), and relocation records. **Chained fixups**,
-//! **encryption info**, and **code signature** load commands are parsed
-//! enough to detect and (for chained) surface import names — see
-//! [`ChainedFixups`] / [`EncryptionInfo`].
+//! opcodes (non-chained), and relocation records. **Chained fixups**
+//! (`LC_DYLD_CHAINED_FIXUPS`) parse the public `mach-o/fixup-chains.h`
+//! layouts: header, import names, `dyld_chained_starts_in_image` /
+//! per-segment page starts, and a chain walk for common 64-bit pointer
+//! formats (see [`ChainedFixups`]). **Encryption info** and **code
+//! signature** load commands are detected — see [`EncryptionInfo`].
 
 use crate::error::{ParseError, Result};
 use crate::reader::Reader;
@@ -107,6 +109,39 @@ pub const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
 
 /// Cap on chained-fixup import table entries.
 pub const MAX_CHAINED_IMPORTS: u32 = 65_536;
+/// Cap on `dyld_chained_starts_in_image.seg_count`.
+pub const MAX_CHAINED_SEGS: u32 = 256;
+/// Cap on `dyld_chained_starts_in_segment.page_count` per segment.
+pub const MAX_CHAINED_PAGES: u32 = 65_536;
+/// Cap on total pointer-chain steps across the image (hostile loops).
+pub const MAX_CHAIN_STEPS: usize = 1_048_576;
+/// Cap on bind slots emitted from the chain walk.
+pub const MAX_CHAINED_BINDS: usize = 65_536;
+
+/// `DYLD_CHAINED_PTR_ARM64E` — stride 8.
+pub const DYLD_CHAINED_PTR_ARM64E: u16 = 1;
+/// `DYLD_CHAINED_PTR_64` — stride 4, target is vmaddr.
+pub const DYLD_CHAINED_PTR_64: u16 = 2;
+/// `DYLD_CHAINED_PTR_64_OFFSET` — stride 4, target is vm offset.
+pub const DYLD_CHAINED_PTR_64_OFFSET: u16 = 6;
+/// `DYLD_CHAINED_PTR_ARM64E_KERNEL` — stride 4.
+pub const DYLD_CHAINED_PTR_ARM64E_KERNEL: u16 = 7;
+/// `DYLD_CHAINED_PTR_ARM64E_USERLAND` — stride 8.
+pub const DYLD_CHAINED_PTR_ARM64E_USERLAND: u16 = 9;
+/// `DYLD_CHAINED_PTR_ARM64E_FIRMWARE` — stride 4.
+pub const DYLD_CHAINED_PTR_ARM64E_FIRMWARE: u16 = 10;
+/// `DYLD_CHAINED_PTR_ARM64E_USERLAND24` — stride 8, 24-bit bind ordinal.
+pub const DYLD_CHAINED_PTR_ARM64E_USERLAND24: u16 = 12;
+
+/// `DYLD_CHAINED_PTR_START_NONE` in `page_start[]`.
+const DYLD_CHAINED_PTR_START_NONE: u16 = 0xFFFF;
+/// `DYLD_CHAINED_PTR_START_MULTI` flag in `page_start[]` (32-bit multi-start).
+const DYLD_CHAINED_PTR_START_MULTI: u16 = 0x8000;
+
+/// `DYLD_CHAINED_IMPORT` / `_ADDEND` / `_ADDEND64`.
+const DYLD_CHAINED_IMPORT: u32 = 1;
+const DYLD_CHAINED_IMPORT_ADDEND: u32 = 2;
+const DYLD_CHAINED_IMPORT_ADDEND64: u32 = 3;
 
 /// Header flag: the object has no undefined references (`MH_NOUNDEFS`).
 pub const MH_NOUNDEFS: u32 = 0x1;
@@ -345,7 +380,18 @@ pub struct EncryptionInfo {
     pub cryptid: u32,
 }
 
-/// Chained-fixups header + import symbol names (bind side).
+/// One bind slot discovered by walking chained-fixup pointer chains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainedBindSlot {
+    /// Virtual address of the pointer slot in the preferred address space.
+    pub slot_va: u64,
+    /// Import table ordinal resolved against [`ChainedFixups::import_names`].
+    pub ordinal: u32,
+    /// Imported symbol name (empty if the ordinal was out of range).
+    pub name: String,
+}
+
+/// Chained-fixups header, import names, and bind slots from a chain walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainedFixups {
     pub fixups_version: u32,
@@ -354,6 +400,8 @@ pub struct ChainedFixups {
     pub symbols_format: u32,
     /// Import symbol names in table order (empty string if unresolved).
     pub import_names: Vec<String>,
+    /// Bind entries found by walking `dyld_chained_starts_*` pointer chains.
+    pub bind_slots: Vec<ChainedBindSlot>,
     pub dataoff: u32,
     pub datasize: u32,
 }
@@ -494,7 +542,9 @@ impl MachFile {
         };
 
         let chained_fixups = match chained_linkedit {
-            Some((dataoff, datasize)) => Some(parse_chained_fixups(data, dataoff, datasize)?),
+            Some((dataoff, datasize)) => {
+                Some(parse_chained_fixups(data, dataoff, datasize, &segments)?)
+            }
             None => None,
         };
 
@@ -1039,10 +1089,86 @@ fn parse_encryption_info_64(body: &[u8]) -> Result<EncryptionInfo> {
 
 /// `dyld_chained_fixups_header` size.
 const CHAINED_FIXUPS_HEADER_SIZE: usize = 28;
-/// `dyld_chained_import` (format 1): lib_ordinal:8, weak:1, name_offset:23.
-const CHAINED_IMPORT_SIZE: u64 = 4;
+/// Fixed header of `dyld_chained_starts_in_segment` before `page_start[]`.
+const CHAINED_STARTS_SEG_HEADER: usize = 22;
 
-fn parse_chained_fixups(data: &[u8], dataoff: u32, datasize: u32) -> Result<ChainedFixups> {
+fn import_entry_size(imports_format: u32) -> Option<u64> {
+    match imports_format {
+        DYLD_CHAINED_IMPORT => Some(4),
+        DYLD_CHAINED_IMPORT_ADDEND => Some(8),
+        DYLD_CHAINED_IMPORT_ADDEND64 => Some(16),
+        _ => None,
+    }
+}
+
+/// Stride in bytes for a `DYLD_CHAINED_PTR_*` format we know how to walk.
+fn pointer_stride(pointer_format: u16) -> Option<u64> {
+    match pointer_format {
+        DYLD_CHAINED_PTR_ARM64E
+        | DYLD_CHAINED_PTR_ARM64E_USERLAND
+        | DYLD_CHAINED_PTR_ARM64E_USERLAND24 => Some(8),
+        DYLD_CHAINED_PTR_ARM64E_KERNEL | DYLD_CHAINED_PTR_ARM64E_FIRMWARE => Some(4),
+        DYLD_CHAINED_PTR_64 | DYLD_CHAINED_PTR_64_OFFSET => Some(4),
+        _ => None,
+    }
+}
+
+/// Decode one chain pointer. Returns `(is_bind, ordinal, next)` where
+/// `next` is the chain step count (multiply by stride for byte distance).
+fn decode_chain_pointer(pointer_format: u16, raw: u64) -> Option<(bool, u32, u32)> {
+    match pointer_format {
+        DYLD_CHAINED_PTR_64 | DYLD_CHAINED_PTR_64_OFFSET => {
+            let bind = ((raw >> 63) & 1) != 0;
+            let next = ((raw >> 51) & 0xFFF) as u32;
+            let ordinal = (raw & 0xFF_FFFF) as u32;
+            Some((bind, ordinal, next))
+        }
+        DYLD_CHAINED_PTR_ARM64E
+        | DYLD_CHAINED_PTR_ARM64E_KERNEL
+        | DYLD_CHAINED_PTR_ARM64E_USERLAND
+        | DYLD_CHAINED_PTR_ARM64E_FIRMWARE => {
+            // auth is bit 63; bind is bit 62; next is bits 51..61 (11 bits).
+            let bind = ((raw >> 62) & 1) != 0;
+            let next = ((raw >> 51) & 0x7FF) as u32;
+            let ordinal = (raw & 0xFFFF) as u32;
+            Some((bind, ordinal, next))
+        }
+        DYLD_CHAINED_PTR_ARM64E_USERLAND24 => {
+            let bind = ((raw >> 62) & 1) != 0;
+            let next = ((raw >> 51) & 0x7FF) as u32;
+            let ordinal = (raw & 0xFF_FFFF) as u32;
+            Some((bind, ordinal, next))
+        }
+        _ => None,
+    }
+}
+
+fn preferred_load_address(segments: &[Segment64]) -> u64 {
+    segments
+        .iter()
+        .find(|s| s.fileoff == 0 && s.filesize != 0)
+        .or_else(|| segments.first())
+        .map(|s| s.vmaddr)
+        .unwrap_or(0)
+}
+
+fn read_u64_at_va(data: &[u8], segments: &[Segment64], va: u64) -> Option<u64> {
+    let seg = segments.iter().find(|s| s.contains_vaddr(va))?;
+    let off = seg.fileoff.checked_add(va - seg.vmaddr)? as usize;
+    if off.checked_add(8)? > data.len() {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&data[off..off + 8]);
+    Some(u64::from_le_bytes(buf))
+}
+
+fn parse_chained_fixups(
+    data: &[u8],
+    dataoff: u32,
+    datasize: u32,
+    segments: &[Segment64],
+) -> Result<ChainedFixups> {
     check_range(
         dataoff as u64,
         datasize as u64,
@@ -1058,7 +1184,7 @@ fn parse_chained_fixups(data: &[u8], dataoff: u32, datasize: u32) -> Result<Chai
     let blob = &data[base..base + datasize as usize];
     let mut r = Reader::new(blob);
     let fixups_version = r.u32()?;
-    let _starts_offset = r.u32()?;
+    let starts_offset = r.u32()?;
     let imports_offset = r.u32()?;
     let symbols_offset = r.u32()?;
     let imports_count = r.u32()?;
@@ -1072,15 +1198,15 @@ fn parse_chained_fixups(data: &[u8], dataoff: u32, datasize: u32) -> Result<Chai
     }
 
     let mut import_names = Vec::new();
-    // Format 1 (`DYLD_CHAINED_IMPORT`) only in this slice; others yield
-    // empty names but still record the header (honest partial).
-    if imports_format == 1 && symbols_format == 0 {
+    if symbols_format == 0
+        && let Some(entsize) = import_entry_size(imports_format)
+    {
         let imp_off = imports_offset as usize;
         let sym_off = symbols_offset as usize;
         check_table(
             imp_off as u64,
             imports_count as u64,
-            CHAINED_IMPORT_SIZE,
+            entsize,
             blob.len(),
             "chained imports",
         )?;
@@ -1092,12 +1218,31 @@ fn parse_chained_fixups(data: &[u8], dataoff: u32, datasize: u32) -> Result<Chai
         let mut ir = Reader::new(blob);
         ir.seek(imp_off)?;
         for _ in 0..imports_count {
-            let word = ir.u32()?;
-            let name_offset = (word >> 9) as usize; // bits 9..31
+            let name_offset = match imports_format {
+                DYLD_CHAINED_IMPORT | DYLD_CHAINED_IMPORT_ADDEND => {
+                    let word = ir.u32()?;
+                    if imports_format == DYLD_CHAINED_IMPORT_ADDEND {
+                        let _addend = ir.u32()?;
+                    }
+                    (word >> 9) as usize
+                }
+                DYLD_CHAINED_IMPORT_ADDEND64 => {
+                    let word = ir.u64()?;
+                    let _addend = ir.u64()?;
+                    (word >> 32) as usize
+                }
+                _ => unreachable!(),
+            };
             let name = read_c_string(blob, sym_off.saturating_add(name_offset))?;
             import_names.push(name);
         }
     }
+
+    let bind_slots = if starts_offset != 0 {
+        walk_chained_binds(data, blob, starts_offset as usize, segments, &import_names)?
+    } else {
+        Vec::new()
+    };
 
     Ok(ChainedFixups {
         fixups_version,
@@ -1105,9 +1250,160 @@ fn parse_chained_fixups(data: &[u8], dataoff: u32, datasize: u32) -> Result<Chai
         imports_format,
         symbols_format,
         import_names,
+        bind_slots,
         dataoff,
         datasize,
     })
+}
+
+/// Walk `dyld_chained_starts_in_image` / per-segment page chains and
+/// collect bind slots. Unknown pointer formats and MULTI page starts are
+/// skipped (honest partial); hostile counts refuse.
+fn walk_chained_binds(
+    data: &[u8],
+    blob: &[u8],
+    starts_offset: usize,
+    segments: &[Segment64],
+    import_names: &[String],
+) -> Result<Vec<ChainedBindSlot>> {
+    if starts_offset >= blob.len() {
+        return Err(ParseError::Unsupported(
+            "chained starts_offset past blob".into(),
+        ));
+    }
+    let starts = &blob[starts_offset..];
+    if starts.len() < 4 {
+        return Err(ParseError::Unsupported(
+            "chained starts truncated before seg_count".into(),
+        ));
+    }
+    let mut sr = Reader::new(starts);
+    let seg_count = sr.u32()?;
+    if seg_count > MAX_CHAINED_SEGS {
+        return Err(ParseError::Unsupported(format!(
+            "chained seg_count {seg_count} exceeds cap {MAX_CHAINED_SEGS}"
+        )));
+    }
+    check_table(
+        4,
+        seg_count as u64,
+        4,
+        starts.len(),
+        "chained seg_info_offset",
+    )?;
+
+    let image_base = preferred_load_address(segments);
+    let mut bind_slots = Vec::new();
+    let mut steps = 0usize;
+
+    for i in 0..seg_count {
+        let info_off = {
+            let mut rr = Reader::new(starts);
+            rr.seek(4 + (i as usize) * 4)?;
+            rr.u32()?
+        };
+        if info_off == 0 {
+            continue;
+        }
+        let info_base = info_off as usize;
+        if info_base
+            .checked_add(CHAINED_STARTS_SEG_HEADER)
+            .is_none_or(|e| e > starts.len())
+        {
+            return Err(ParseError::Unsupported(
+                "chained starts_in_segment header past blob".into(),
+            ));
+        }
+        let mut ir = Reader::new(starts);
+        ir.seek(info_base)?;
+        let _size = ir.u32()?;
+        let page_size = ir.u16()? as u64;
+        let pointer_format = ir.u16()?;
+        let segment_offset = ir.u64()?;
+        let _max_valid_pointer = ir.u32()?;
+        let page_count = ir.u16()? as u32;
+
+        if page_size != 0x1000 && page_size != 0x4000 {
+            return Err(ParseError::Unsupported(format!(
+                "chained page_size {page_size:#x} is not 0x1000 or 0x4000"
+            )));
+        }
+        if page_count > MAX_CHAINED_PAGES {
+            return Err(ParseError::Unsupported(format!(
+                "chained page_count {page_count} exceeds cap {MAX_CHAINED_PAGES}"
+            )));
+        }
+        let page_starts_off = info_base + CHAINED_STARTS_SEG_HEADER;
+        check_table(
+            page_starts_off as u64,
+            page_count as u64,
+            2,
+            starts.len(),
+            "chained page_start",
+        )?;
+
+        let Some(stride) = pointer_stride(pointer_format) else {
+            // Format we do not decode: skip this segment rather than guess.
+            continue;
+        };
+
+        let seg_va = image_base.wrapping_add(segment_offset);
+        for page_idx in 0..page_count {
+            let mut pr = Reader::new(starts);
+            pr.seek(page_starts_off + (page_idx as usize) * 2)?;
+            let page_start = pr.u16()?;
+            if page_start == DYLD_CHAINED_PTR_START_NONE {
+                continue;
+            }
+            // Multi-start pages (32-bit) are out of scope for this 64-bit walk.
+            if page_start & DYLD_CHAINED_PTR_START_MULTI != 0 {
+                continue;
+            }
+
+            let mut loc = seg_va
+                .wrapping_add((page_idx as u64).wrapping_mul(page_size))
+                .wrapping_add(page_start as u64);
+
+            loop {
+                if steps >= MAX_CHAIN_STEPS {
+                    return Err(ParseError::Unsupported(format!(
+                        "chained fixup walk exceeds step cap {MAX_CHAIN_STEPS}"
+                    )));
+                }
+                steps += 1;
+
+                let Some(raw) = read_u64_at_va(data, segments, loc) else {
+                    break;
+                };
+                let Some((is_bind, ordinal, next)) = decode_chain_pointer(pointer_format, raw)
+                else {
+                    break;
+                };
+                if is_bind {
+                    if bind_slots.len() >= MAX_CHAINED_BINDS {
+                        return Err(ParseError::Unsupported(format!(
+                            "chained bind slots exceed cap {MAX_CHAINED_BINDS}"
+                        )));
+                    }
+                    let name = import_names
+                        .get(ordinal as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    bind_slots.push(ChainedBindSlot {
+                        slot_va: loc,
+                        ordinal,
+                        name,
+                    });
+                }
+                if next == 0 {
+                    break;
+                }
+                loc = loc.wrapping_add((next as u64).wrapping_mul(stride));
+            }
+        }
+    }
+
+    Ok(bind_slots)
 }
 
 fn read_c_string(blob: &[u8], off: usize) -> Result<String> {
@@ -1846,16 +2142,235 @@ pub(crate) mod tests {
         // import word: name_offset=0 in symbols → bits 9.. = 0
         blob[28..32].copy_from_slice(&0u32.to_le_bytes());
         blob[32..37].copy_from_slice(b"puts\0");
-        let cf = parse_chained_fixups(&blob, 0, blob.len() as u32).unwrap();
+        let cf = parse_chained_fixups(&blob, 0, blob.len() as u32, &[]).unwrap();
         assert_eq!(cf.imports_count, 1);
         assert_eq!(cf.import_names, vec!["puts".to_string()]);
+        assert!(cf.bind_slots.is_empty());
     }
 
     #[test]
     fn chained_imports_cap_refuses() {
         let mut blob = vec![0u8; 28];
         blob[16..20].copy_from_slice(&(MAX_CHAINED_IMPORTS + 1).to_le_bytes());
-        assert!(parse_chained_fixups(&blob, 0, 28).is_err());
+        assert!(parse_chained_fixups(&blob, 0, 28, &[]).is_err());
+    }
+
+    #[test]
+    fn chained_seg_count_cap_refuses() {
+        let mut blob = vec![0u8; 64];
+        blob[4..8].copy_from_slice(&28u32.to_le_bytes()); // starts at 28
+        blob[28..32].copy_from_slice(&(MAX_CHAINED_SEGS + 1).to_le_bytes());
+        assert!(parse_chained_fixups(&blob, 0, blob.len() as u32, &[]).is_err());
+    }
+
+    /// Minimal segment covering `[vmaddr, vmaddr+filesize)` at fileoff 0.
+    fn test_seg(vmaddr: u64, filesize: u64) -> Segment64 {
+        Segment64 {
+            segname: "__DATA".into(),
+            vmaddr,
+            vmsize: filesize,
+            fileoff: 0,
+            filesize,
+            maxprot: VM_PROT_READ | VM_PROT_WRITE,
+            initprot: VM_PROT_READ | VM_PROT_WRITE,
+            flags: 0,
+            sections: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn chained_fixups_walk_ptr64_offset_bind() {
+        // File layout:
+        //   [0x100]: DYLD_CHAINED_PTR_64_OFFSET bind ordinal 0, next 0
+        //   [0x800]: fixups blob (header + starts + import + "puts")
+        // Segment at preferred base 0x1_0000_0000, fileoff 0 → VA 0x1_0000_0100.
+        const BASE: u64 = 0x1_0000_0000;
+        let mut data = vec![0u8; 0x1000];
+        let raw: u64 = 1u64 << 63; // bind=1, ordinal=0, next=0
+        data[0x100..0x108].copy_from_slice(&raw.to_le_bytes());
+
+        let blob_off = 0x800usize;
+        // Header: starts=28, imports=28+4+4+24=60, symbols=64, count=1, fmt=1
+        // starts at blob+28:
+        //   seg_count=1, seg_info_offset[0]=8
+        //   at +8: size=24, page_size=0x1000, fmt=6, seg_off=0, max=0, pages=1, start=0x100
+        let imports_off = 60u32;
+        let symbols_off = 64u32;
+        let mut blob = vec![0u8; 96];
+        blob[0..4].copy_from_slice(&0u32.to_le_bytes());
+        blob[4..8].copy_from_slice(&28u32.to_le_bytes());
+        blob[8..12].copy_from_slice(&imports_off.to_le_bytes());
+        blob[12..16].copy_from_slice(&symbols_off.to_le_bytes());
+        blob[16..20].copy_from_slice(&1u32.to_le_bytes());
+        blob[20..24].copy_from_slice(&DYLD_CHAINED_IMPORT.to_le_bytes());
+        blob[24..28].copy_from_slice(&0u32.to_le_bytes());
+
+        // starts_in_image at 28
+        blob[28..32].copy_from_slice(&1u32.to_le_bytes()); // seg_count
+        blob[32..36].copy_from_slice(&8u32.to_le_bytes()); // seg_info_offset[0]
+        // starts_in_segment at 28+8=36
+        blob[36..40].copy_from_slice(&24u32.to_le_bytes()); // size
+        blob[40..42].copy_from_slice(&0x1000u16.to_le_bytes()); // page_size
+        blob[42..44].copy_from_slice(&DYLD_CHAINED_PTR_64_OFFSET.to_le_bytes());
+        blob[44..52].copy_from_slice(&0u64.to_le_bytes()); // segment_offset
+        blob[52..56].copy_from_slice(&0u32.to_le_bytes()); // max_valid_pointer
+        blob[56..58].copy_from_slice(&1u16.to_le_bytes()); // page_count
+        blob[58..60].copy_from_slice(&0x100u16.to_le_bytes()); // page_start[0]
+
+        blob[60..64].copy_from_slice(&0u32.to_le_bytes()); // import
+        blob[64..69].copy_from_slice(b"puts\0");
+
+        data[blob_off..blob_off + blob.len()].copy_from_slice(&blob);
+
+        let segs = [test_seg(BASE, 0x1000)];
+        let cf = parse_chained_fixups(&data, blob_off as u32, blob.len() as u32, &segs).unwrap();
+        assert_eq!(cf.import_names, vec!["puts".to_string()]);
+        assert_eq!(
+            cf.bind_slots,
+            vec![ChainedBindSlot {
+                slot_va: BASE + 0x100,
+                ordinal: 0,
+                name: "puts".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn chained_fixups_walk_arm64e_userland24_bind() {
+        const BASE: u64 = 0x1_0000_0000;
+        let mut data = vec![0u8; 0x1000];
+        // arm64e bind24: bind bit 62, ordinal in low 24, next=0
+        let raw: u64 = 1u64 << 62;
+        data[0x200..0x208].copy_from_slice(&raw.to_le_bytes());
+
+        let blob_off = 0x800usize;
+        let mut blob = vec![0u8; 96];
+        blob[4..8].copy_from_slice(&28u32.to_le_bytes());
+        blob[8..12].copy_from_slice(&60u32.to_le_bytes());
+        blob[12..16].copy_from_slice(&64u32.to_le_bytes());
+        blob[16..20].copy_from_slice(&1u32.to_le_bytes());
+        blob[20..24].copy_from_slice(&DYLD_CHAINED_IMPORT.to_le_bytes());
+
+        blob[28..32].copy_from_slice(&1u32.to_le_bytes());
+        blob[32..36].copy_from_slice(&8u32.to_le_bytes());
+        blob[36..40].copy_from_slice(&24u32.to_le_bytes());
+        blob[40..42].copy_from_slice(&0x1000u16.to_le_bytes());
+        blob[42..44].copy_from_slice(&DYLD_CHAINED_PTR_ARM64E_USERLAND24.to_le_bytes());
+        blob[44..52].copy_from_slice(&0u64.to_le_bytes());
+        blob[56..58].copy_from_slice(&1u16.to_le_bytes());
+        blob[58..60].copy_from_slice(&0x200u16.to_le_bytes());
+
+        blob[60..64].copy_from_slice(&0u32.to_le_bytes());
+        blob[64..70].copy_from_slice(b"write\0");
+        data[blob_off..blob_off + blob.len()].copy_from_slice(&blob);
+
+        let segs = [test_seg(BASE, 0x1000)];
+        let cf = parse_chained_fixups(&data, blob_off as u32, blob.len() as u32, &segs).unwrap();
+        assert_eq!(
+            cf.bind_slots,
+            vec![ChainedBindSlot {
+                slot_va: BASE + 0x200,
+                ordinal: 0,
+                name: "write".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn chained_fixups_rebase_is_not_a_bind_slot() {
+        const BASE: u64 = 0x1_0000_0000;
+        let mut data = vec![0u8; 0x1000];
+        // bind bit clear → rebase; must not appear as an import slot.
+        let raw: u64 = 0x1234;
+        data[0x100..0x108].copy_from_slice(&raw.to_le_bytes());
+
+        let blob_off = 0x800usize;
+        let mut blob = vec![0u8; 96];
+        blob[4..8].copy_from_slice(&28u32.to_le_bytes());
+        blob[8..12].copy_from_slice(&60u32.to_le_bytes());
+        blob[12..16].copy_from_slice(&64u32.to_le_bytes());
+        blob[16..20].copy_from_slice(&1u32.to_le_bytes());
+        blob[20..24].copy_from_slice(&DYLD_CHAINED_IMPORT.to_le_bytes());
+        blob[28..32].copy_from_slice(&1u32.to_le_bytes());
+        blob[32..36].copy_from_slice(&8u32.to_le_bytes());
+        blob[36..40].copy_from_slice(&24u32.to_le_bytes());
+        blob[40..42].copy_from_slice(&0x1000u16.to_le_bytes());
+        blob[42..44].copy_from_slice(&DYLD_CHAINED_PTR_64_OFFSET.to_le_bytes());
+        blob[56..58].copy_from_slice(&1u16.to_le_bytes());
+        blob[58..60].copy_from_slice(&0x100u16.to_le_bytes());
+        blob[60..64].copy_from_slice(&0u32.to_le_bytes());
+        blob[64..69].copy_from_slice(b"puts\0");
+        data[blob_off..blob_off + blob.len()].copy_from_slice(&blob);
+
+        let cf =
+            parse_chained_fixups(&data, blob_off as u32, blob.len() as u32, &[test_seg(BASE, 0x1000)])
+                .unwrap();
+        assert!(cf.bind_slots.is_empty());
+    }
+
+    #[test]
+    fn chained_bad_page_size_refuses() {
+        let mut blob = vec![0u8; 128];
+        blob[4..8].copy_from_slice(&28u32.to_le_bytes());
+        blob[28..32].copy_from_slice(&1u32.to_le_bytes());
+        blob[32..36].copy_from_slice(&8u32.to_le_bytes());
+        blob[36..40].copy_from_slice(&24u32.to_le_bytes());
+        blob[40..42].copy_from_slice(&0x2000u16.to_le_bytes()); // not 0x1000/0x4000
+        blob[42..44].copy_from_slice(&DYLD_CHAINED_PTR_64_OFFSET.to_le_bytes());
+        blob[56..58].copy_from_slice(&1u16.to_le_bytes());
+        blob[58..60].copy_from_slice(&0u16.to_le_bytes());
+        assert!(parse_chained_fixups(&blob, 0, blob.len() as u32, &[]).is_err());
+    }
+
+    #[test]
+    fn chained_fixups_walk_follows_next_stride() {
+        const BASE: u64 = 0x1_0000_0000;
+        let mut data = vec![0u8; 0x1000];
+        // First bind ordinal 0, next=2 → +8 bytes (stride 4).
+        let raw0: u64 = (1u64 << 63) | (2u64 << 51);
+        // Second bind ordinal 1, next=0.
+        let raw1: u64 = (1u64 << 63) | 1;
+        data[0x100..0x108].copy_from_slice(&raw0.to_le_bytes());
+        data[0x108..0x110].copy_from_slice(&raw1.to_le_bytes());
+
+        let blob_off = 0x800usize;
+        let mut blob = vec![0u8; 112];
+        blob[4..8].copy_from_slice(&28u32.to_le_bytes());
+        blob[8..12].copy_from_slice(&60u32.to_le_bytes());
+        blob[12..16].copy_from_slice(&68u32.to_le_bytes());
+        blob[16..20].copy_from_slice(&2u32.to_le_bytes());
+        blob[20..24].copy_from_slice(&DYLD_CHAINED_IMPORT.to_le_bytes());
+        blob[28..32].copy_from_slice(&1u32.to_le_bytes());
+        blob[32..36].copy_from_slice(&8u32.to_le_bytes());
+        blob[36..40].copy_from_slice(&24u32.to_le_bytes());
+        blob[40..42].copy_from_slice(&0x1000u16.to_le_bytes());
+        blob[42..44].copy_from_slice(&DYLD_CHAINED_PTR_64_OFFSET.to_le_bytes());
+        blob[56..58].copy_from_slice(&1u16.to_le_bytes());
+        blob[58..60].copy_from_slice(&0x100u16.to_le_bytes());
+        blob[60..64].copy_from_slice(&0u32.to_le_bytes()); // name_offset 0 → puts
+        // second import: name_offset = 5 ("puts\0" then "gets\0")
+        blob[64..68].copy_from_slice(&(5u32 << 9).to_le_bytes());
+        blob[68..78].copy_from_slice(b"puts\0gets\0");
+        data[blob_off..blob_off + blob.len()].copy_from_slice(&blob);
+
+        let cf =
+            parse_chained_fixups(&data, blob_off as u32, blob.len() as u32, &[test_seg(BASE, 0x1000)])
+                .unwrap();
+        assert_eq!(
+            cf.bind_slots,
+            vec![
+                ChainedBindSlot {
+                    slot_va: BASE + 0x100,
+                    ordinal: 0,
+                    name: "puts".into(),
+                },
+                ChainedBindSlot {
+                    slot_va: BASE + 0x108,
+                    ordinal: 1,
+                    name: "gets".into(),
+                },
+            ]
+        );
     }
 
     #[test]

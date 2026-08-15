@@ -44,6 +44,9 @@ pub mod irssa;
 pub mod irssaopt;
 pub mod irstruct;
 pub mod irstack;
+pub mod mempromote;
+pub mod sig;
+pub mod types;
 pub mod elf;
 pub mod error;
 // The slice-19 evaluation harness: test-only, so it can drive `irout`'s

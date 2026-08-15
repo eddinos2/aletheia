@@ -24,7 +24,8 @@ use aletheia::pe::{ImportSymbol, ImportedDll, Machine, PeFile, PeFormat, Section
 use aletheia::model::Arch;
 use aletheia::{
     aarch64, annotate, callfx, cfg, devirt, diff, gostrings, gotype, irlift, irout, irssa,
-    irssaopt, irstruct, irstack, jumptable, listing, patch, pseudo, rustmeta, vtable, x86,
+    irssaopt, irstruct, irstack, jumptable, listing, mempromote, patch, pseudo, rustmeta, sig,
+    vtable, x86,
 };
 
 const USAGE: &str = "usage: redump <file> [--headers] [--sections] [--imports] [--symbols] [--exports] [--disasm[=N]] [--listing[=N]] [--db <path>] [--diff <new>]
@@ -100,6 +101,10 @@ const USAGE: &str = "usage: redump <file> [--headers] [--sections] [--imports] [
 
   --stack[=N]   affine SP tracking + stack slots (DESIGN irstack), up to
                 N functions (default 4)
+  --promote[=N] stack-slot promotion candidates (MEM promote helper), up to
+                N functions (default 4)
+  --sigs[=N]    callee-side signature recovery (DESIGN sig), up to
+                N functions (default 4)
   --patch-nop=<va>
                 preview a same-length NOP PatchSet at VA (hex), hash-bound
   --patch-apply-nop=<va>
@@ -107,7 +112,8 @@ const USAGE: &str = "usage: redump <file> [--headers] [--sections] [--imports] [
 
 With no selective flag, everything except --disasm, --listing, --diff,
 --vtables, --rustmeta, --gotypes, --devirt, --gostrings, --lift,
---simplify, --ssa, --ssa-opt, --structure, and --decompile is dumped.";
+--simplify, --ssa, --ssa-opt, --structure, --decompile, --stack,
+--promote, and --sigs is dumped.";
 
 /// Instructions swept by `--disasm` when no count is given.
 const DEFAULT_DISASM_COUNT: usize = 32;
@@ -162,6 +168,10 @@ struct Options {
     decompile: Option<usize>,
     /// `Some(n)`: dump affine SP / stack-slot facts for up to `n` functions.
     stack: Option<usize>,
+    /// `Some(n)`: dump stack-slot promotion decisions for up to `n` functions.
+    promote: Option<usize>,
+    /// `Some(n)`: dump callee-side signatures for up to `n` functions.
+    sigs: Option<usize>,
     /// Preview a 4-byte NOP PatchSet at this VA (aarch64 NOP / x86 0x90).
     patch_nop: Option<u64>,
     /// When set with `patch_nop`, apply to sibling `*.patched`.
@@ -337,8 +347,139 @@ fn dump(
     if let Some(max) = opts.stack {
         print_stack(path, data, format, max, out)?;
     }
+    if let Some(max) = opts.promote {
+        print_promote(path, data, format, max, out)?;
+    }
+    if let Some(max) = opts.sigs {
+        print_sigs(path, data, format, max, out)?;
+    }
     if let Some(va) = opts.patch_nop {
         print_patch_nop(path, data, format, va, opts.patch_apply, out)?;
+    }
+    Ok(())
+}
+
+
+fn print_promote(
+    path: &str,
+    data: &[u8],
+    format: Option<Format>,
+    max_functions: usize,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("{path}: {e}");
+    writeln!(out, "\nPROMOTE").map_err(io)?;
+    if format == Some(Format::MachOFat) {
+        return writeln!(
+            out,
+            "  (a fat container holds no single image; extract a slice first)"
+        )
+        .map_err(io);
+    }
+    let image = aletheia::load(data).map_err(|e| format!("{path}: {e}"))?;
+    if !matches!(image.arch(), Arch::X86_64 | Arch::Aarch64) {
+        return writeln!(out, "  (slot promotion needs x86-64 or aarch64)").map_err(io);
+    }
+    if let Ok(mach) = aletheia::macho::MachFile::parse(data)
+        && mach.is_encrypted()
+    {
+        writeln!(
+            out,
+            "// warning: encrypted segment (cryptid!=0) — analysis may be garbage"
+        )
+        .map_err(io)?;
+    }
+    let folded =
+        jumptable::resolve_folded(image.as_ref()).map_err(|e| format!("{path}: {e}"))?;
+    let program = folded.program;
+    for func in program.functions.values().take(max_functions) {
+        let Some(lifted) = irlift::lift_function(image.as_ref(), func) else {
+            continue;
+        };
+        let lifted = match callfx::abi_for(image.arch()) {
+            Some(abi) => callfx::apply(&lifted, &abi),
+            None => lifted,
+        };
+        let ssa = match irssa::construct(&lifted) {
+            Ok(s) => s,
+            Err(e) => {
+                writeln!(out, "// sub_{:x}: no ssa ({e})", lifted.entry).map_err(io)?;
+                continue;
+            }
+        };
+        let (opt, _) = irssaopt::optimize(&ssa);
+        let (fwd, _) = irssaopt::forward(&opt);
+        let live_out = callfx::function_live_out(image.arch()).unwrap_or_default();
+        let (swept, _) = irssaopt::eliminate_dead(&fwd, &live_out);
+        let stack = irstack::analyze(&swept);
+        if let Err(e) = irstack::check(&swept, &stack) {
+            writeln!(out, "// stack check failed: {e}").map_err(io)?;
+        }
+        let facts = mempromote::promote(&swept, &stack);
+        if let Err(e) = mempromote::check(&swept, &stack, &facts) {
+            writeln!(out, "// promote check failed: {e}").map_err(io)?;
+        }
+        out.write_all(facts.render().as_bytes()).map_err(io)?;
+    }
+    Ok(())
+}
+
+fn print_sigs(
+    path: &str,
+    data: &[u8],
+    format: Option<Format>,
+    max_functions: usize,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("{path}: {e}");
+    writeln!(out, "\nSIGNATURES").map_err(io)?;
+    if format == Some(Format::MachOFat) {
+        return writeln!(
+            out,
+            "  (a fat container holds no single image; extract a slice first)"
+        )
+        .map_err(io);
+    }
+    let image = aletheia::load(data).map_err(|e| format!("{path}: {e}"))?;
+    if !matches!(image.arch(), Arch::X86_64 | Arch::Aarch64) {
+        return writeln!(out, "  (signature recovery needs x86-64 or aarch64)").map_err(io);
+    }
+    if let Ok(mach) = aletheia::macho::MachFile::parse(data)
+        && mach.is_encrypted()
+    {
+        writeln!(
+            out,
+            "// warning: LC_ENCRYPTION_INFO_64 cryptid!=0 — on-disk text may be ciphertext"
+        )
+        .map_err(io)?;
+    }
+    let folded =
+        jumptable::resolve_folded(image.as_ref()).map_err(|e| format!("{path}: {e}"))?;
+    let program = folded.program;
+    for func in program.functions.values().take(max_functions) {
+        let Some(lifted) = irlift::lift_function(image.as_ref(), func) else {
+            continue;
+        };
+        let lifted = match callfx::abi_for(image.arch()) {
+            Some(abi) => callfx::apply(&lifted, &abi),
+            None => lifted,
+        };
+        let ssa = match irssa::construct(&lifted) {
+            Ok(s) => s,
+            Err(e) => {
+                writeln!(out, "// sub_{:x}: no ssa ({e})", lifted.entry).map_err(io)?;
+                continue;
+            }
+        };
+        let (opt, _) = irssaopt::optimize(&ssa);
+        let (fwd, _) = irssaopt::forward(&opt);
+        let live_out = callfx::function_live_out(image.arch()).unwrap_or_default();
+        let (swept, _) = irssaopt::eliminate_dead(&fwd, &live_out);
+        let facts = sig::recover(&swept);
+        if let Err(e) = sig::check(&swept, &facts) {
+            writeln!(out, "// check failed: {e}").map_err(io)?;
+        }
+        out.write_all(facts.render().as_bytes()).map_err(io)?;
     }
     Ok(())
 }
@@ -374,8 +515,9 @@ fn print_stack(
         if let Some(cf) = &mach.chained_fixups {
             writeln!(
                 out,
-                "// chained fixups: {} import name(s) parsed",
-                cf.import_names.iter().filter(|n| !n.is_empty()).count()
+                "// chained fixups: {} import name(s), {} bind slot(s)",
+                cf.import_names.iter().filter(|n| !n.is_empty()).count(),
+                cf.bind_slots.len()
             )
             .map_err(io)?;
         }
@@ -989,12 +1131,14 @@ fn parse_args_from<I: Iterator<Item = String>>(
         ssa: None,
         ssa_opt: None,
         structure: None,
-        decompile: None,
-        stack: None,
-        patch_nop: None,
-        patch_apply: false,
-        all: false,
-    };
+            decompile: None,
+            stack: None,
+            promote: None,
+            sigs: None,
+            patch_nop: None,
+            patch_apply: false,
+            all: false,
+        };
     let mut any_flag = false;
     let mut args = args.peekable();
 
@@ -1021,6 +1165,8 @@ fn parse_args_from<I: Iterator<Item = String>>(
             "--structure" => (opts.structure, any_flag) = (Some(DEFAULT_LIFT_FUNCTIONS), true),
             "--decompile" => (opts.decompile, any_flag) = (Some(DEFAULT_LIFT_FUNCTIONS), true),
             "--stack" => (opts.stack, any_flag) = (Some(DEFAULT_LIFT_FUNCTIONS), true),
+            "--promote" => (opts.promote, any_flag) = (Some(DEFAULT_LIFT_FUNCTIONS), true),
+            "--sigs" => (opts.sigs, any_flag) = (Some(DEFAULT_LIFT_FUNCTIONS), true),
             flag if flag.starts_with("--patch-nop=") => {
                 let raw = &flag["--patch-nop=".len()..];
                 let va = parse_hex_u64(raw)
@@ -1097,6 +1243,18 @@ fn parse_args_from<I: Iterator<Item = String>>(
                     .map_err(|_| format!("invalid function count in `{flag}`\n{USAGE}"))?;
                 (opts.stack, any_flag) = (Some(count), true);
             }
+            flag if flag.starts_with("--promote=") => {
+                let count = flag["--promote=".len()..]
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid function count in `{flag}`\n{USAGE}"))?;
+                (opts.promote, any_flag) = (Some(count), true);
+            }
+            flag if flag.starts_with("--sigs=") => {
+                let count = flag["--sigs=".len()..]
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid function count in `{flag}`\n{USAGE}"))?;
+                (opts.sigs, any_flag) = (Some(count), true);
+            }
             flag if flag.starts_with("--db=") => db = Some(flag["--db=".len()..].to_string()),
             flag if flag.starts_with("--diff=") => {
                 (diff, any_flag) = (Some(flag["--diff=".len()..].to_string()), true);
@@ -1138,6 +1296,8 @@ fn parse_args_from<I: Iterator<Item = String>>(
             structure: None,
             decompile: None,
             stack: None,
+            promote: None,
+            sigs: None,
             patch_nop: None,
             patch_apply: false,
             all: true,
@@ -2589,6 +2749,8 @@ mod tests {
             structure: None,
             decompile: None,
             stack: None,
+            promote: None,
+            sigs: None,
             patch_nop: None,
             patch_apply: false,
             all: true,
@@ -2616,6 +2778,8 @@ mod tests {
             structure: None,
             decompile: None,
             stack: None,
+            promote: None,
+            sigs: None,
             patch_nop: None,
             patch_apply: false,
             all: false,
@@ -4139,6 +4303,32 @@ mod tests {
         assert_eq!(opts.decompile, Some(2));
 
         let err = parse(&["a.exe", "--decompile=x"]).unwrap_err();
+        assert!(err.contains("invalid function count"), "{err}");
+    }
+
+    #[test]
+    fn sigs_flag_parses_with_and_without_a_count() {
+        let (_, opts, _) = parse(&["a.exe", "--sigs"]).unwrap();
+        assert_eq!(opts.sigs, Some(DEFAULT_LIFT_FUNCTIONS));
+        assert_eq!(opts.stack, None, "--sigs does not imply --stack");
+
+        let (_, opts, _) = parse(&["a.exe", "--sigs=2"]).unwrap();
+        assert_eq!(opts.sigs, Some(2));
+
+        let err = parse(&["a.exe", "--sigs=x"]).unwrap_err();
+        assert!(err.contains("invalid function count"), "{err}");
+    }
+
+    #[test]
+    fn promote_flag_parses_with_and_without_a_count() {
+        let (_, opts, _) = parse(&["a.exe", "--promote"]).unwrap();
+        assert_eq!(opts.promote, Some(DEFAULT_LIFT_FUNCTIONS));
+        assert_eq!(opts.stack, None, "--promote does not imply --stack");
+
+        let (_, opts, _) = parse(&["a.exe", "--promote=2"]).unwrap();
+        assert_eq!(opts.promote, Some(2));
+
+        let err = parse(&["a.exe", "--promote=x"]).unwrap_err();
         assert!(err.contains("invalid function count"), "{err}");
     }
 
