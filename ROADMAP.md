@@ -113,3 +113,7 @@ Bench checklist: [docs/GUI_BENCH_CHECKLIST.md](docs/GUI_BENCH_CHECKLIST.md).
 Auditable PatchSet objects, preview before write, sibling `*.patched` by
 default, aarch64 assemble from public encodings, resign as a printed
 recipe — never silent overwrite, never claimed FairPlay bypass.
+
+## Agent smoke
+
+Gate M1:  →  →  without a GUI.
