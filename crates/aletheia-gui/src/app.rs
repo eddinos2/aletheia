@@ -2,13 +2,15 @@
 
 use egui::Color32;
 
-use crate::client::{self, Client, DiffInfo, FuncRow, OpenInfo, WhyInfo, XrefsInfo};
+use crate::cfg_view;
+use crate::client::{self, Client, CfgInfo, DiffInfo, FuncRow, OpenInfo, WhyInfo, XrefRow, XrefsInfo};
 use crate::theme::{trust_for_source, Tokens, Trust};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CenterMode {
     Listing,
     Decompile,
+    Cfg,
     Diff,
     Patch,
 }
@@ -31,10 +33,15 @@ pub struct AletheiaApp {
     functions: Vec<FuncRow>,
     selected: Option<usize>,
     filter: String,
+    /// Function-entry VAs for xref / go-to back navigation.
+    nav_stack: Vec<u64>,
+    /// Optional block VA to emphasize in CFG / listing status.
+    focus_va: Option<u64>,
 
     center: CenterMode,
     listing: String,
     decompile: String,
+    cfg_info: CfgInfo,
     why: WhyInfo,
     xrefs: XrefsInfo,
     diff: DiffInfo,
@@ -66,9 +73,12 @@ impl AletheiaApp {
             functions: Vec::new(),
             selected: None,
             filter: String::new(),
+            nav_stack: Vec::new(),
+            focus_va: None,
             center: CenterMode::Listing,
             listing: String::new(),
             decompile: String::new(),
+            cfg_info: CfgInfo::default(),
             why: WhyInfo::default(),
             xrefs: XrefsInfo::default(),
             diff: DiffInfo::default(),
@@ -93,6 +103,8 @@ impl AletheiaApp {
                 }
                 let sid = info.session_id.clone();
                 self.session = Some(info);
+                self.nav_stack.clear();
+                self.focus_va = None;
                 match self.client.functions(&sid, 8192) {
                     Ok(funcs) => {
                         self.functions = funcs;
@@ -157,6 +169,15 @@ impl AletheiaApp {
             Ok(t) => self.decompile = t,
             Err(e) => self.decompile = format!("// decompile error: {e}"),
         }
+        match self.client.cfg(&sess, func.va) {
+            Ok(c) => self.cfg_info = c,
+            Err(e) => {
+                self.cfg_info = CfgInfo::default();
+                if self.center == CenterMode::Cfg {
+                    self.status = format!("cfg: {e}");
+                }
+            }
+        }
         match self.client.why(&sess, func.va) {
             Ok(w) => self.why = w,
             Err(e) => {
@@ -178,6 +199,59 @@ impl AletheiaApp {
         }
     }
 
+    /// Apply an engine delta after rename/annotate — no blind full reload.
+    fn apply_delta(&mut self, delta: client::Delta) {
+        for row in &delta.functions {
+            if let Some(f) = self.functions.iter_mut().find(|f| f.va == row.va) {
+                f.name = row.name.clone();
+                f.source = row.source.clone();
+            }
+        }
+        let Some(sess) = self.session.as_ref().map(|s| s.session_id.clone()) else {
+            return;
+        };
+        let cur = self.selected_func().map(|f| f.va);
+        for inv in &delta.invalidate {
+            if cur != Some(inv.va) {
+                continue;
+            }
+            match inv.view.as_str() {
+                "listing" => {
+                    if let Ok(t) = self.client.listing(&sess, inv.va) {
+                        self.listing = t;
+                    }
+                }
+                "decompile" => {
+                    if let Ok(t) = self.client.decompile(&sess, inv.va) {
+                        self.decompile = t;
+                    }
+                }
+                "why" => {
+                    if let Ok(w) = self.client.why(&sess, inv.va) {
+                        self.why = w;
+                    }
+                }
+                "cfg" => {
+                    if let Ok(c) = self.client.cfg(&sess, inv.va) {
+                        self.cfg_info = c;
+                    }
+                }
+                "xrefs" => {
+                    if let Ok(x) = self.client.xrefs(&sess, inv.va) {
+                        self.xrefs = x;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.status = format!(
+            "delta · {} · {} function(s) · {} invalidate",
+            delta.kind,
+            delta.functions.len(),
+            delta.invalidate.len()
+        );
+    }
+
     fn apply_rename(&mut self) {
         let name = self.rename_buf.trim().to_string();
         if name.is_empty() {
@@ -190,16 +264,9 @@ impl AletheiaApp {
             return;
         };
         match self.client.rename(&sess, func.va, &name) {
-            Ok(()) => {
-                if let Some(i) = self.selected {
-                    if let Some(f) = self.functions.get_mut(i) {
-                        f.name = Some(name.clone());
-                        f.source = "asserted".into();
-                    }
-                }
-                self.status = format!("renamed → {name}");
+            Ok(delta) => {
                 self.modal = Modal::None;
-                self.load_selection();
+                self.apply_delta(delta);
             }
             Err(e) => self.status = format!("rename: {e}"),
         }
@@ -208,7 +275,6 @@ impl AletheiaApp {
     fn goto_address(&mut self) {
         let raw = self.goto_buf.trim().to_string();
         let Some(va) = client::parse_hex(&raw).or_else(|| {
-            // name match
             self.functions
                 .iter()
                 .find(|f| f.name.as_deref() == Some(raw.as_str()))
@@ -217,14 +283,54 @@ impl AletheiaApp {
             self.status = format!("go-to: cannot resolve `{raw}`");
             return;
         };
-        if let Some(i) = self.functions.iter().position(|f| f.va == va) {
+        self.navigate_to_va(va, true);
+        self.modal = Modal::None;
+    }
+
+    /// Jump listing/decompile/CFG to the function owning `va` (via `locate`).
+    fn navigate_to_va(&mut self, va: u64, push: bool) {
+        let Some(sess) = self.session.as_ref().map(|s| s.session_id.clone()) else {
+            return;
+        };
+        if push {
+            if let Some(cur) = self.selected_func().map(|f| f.va) {
+                if cur != va {
+                    self.nav_stack.push(cur);
+                }
+            }
+        }
+        let locate = match self.client.locate(&sess, va) {
+            Ok(l) => l,
+            Err(e) => {
+                self.status = format!("locate: {e}");
+                return;
+            }
+        };
+        let Some(entry) = locate.function else {
+            self.status = format!("no function owns 0x{va:x}");
+            return;
+        };
+        self.focus_va = locate.block.or(Some(va));
+        if let Some(i) = self.functions.iter().position(|f| f.va == entry) {
             self.selected = Some(i);
             self.load_selection();
-            self.modal = Modal::None;
-            self.status = format!("→ 0x{va:x}");
+            self.status = if locate.exact_entry {
+                format!("→ 0x{entry:x}")
+            } else {
+                format!("→ 0x{va:x} in 0x{entry:x}")
+            };
         } else {
-            self.status = format!("no function at 0x{va:x}");
+            self.status = format!("function 0x{entry:x} not in navigator");
         }
+    }
+
+    fn nav_back(&mut self) {
+        let Some(va) = self.nav_stack.pop() else {
+            self.status = "nav stack empty".into();
+            return;
+        };
+        self.navigate_to_va(va, false);
+        self.status = format!("← 0x{va:x}");
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
@@ -279,10 +385,17 @@ impl AletheiaApp {
         if ctx.input(|i| i.key_pressed(egui::Key::U)) {
             self.center = CenterMode::Listing;
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::C)) {
+            self.center = CenterMode::Cfg;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::OpenBracket))
+            || ctx.input(|i| i.key_pressed(egui::Key::Backspace))
+        {
+            self.nav_back();
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Questionmark))
             || (ctx.input(|i| i.modifiers.shift) && ctx.input(|i| i.key_pressed(egui::Key::Slash)))
         {
-            // refresh why pin
             if let (Some(sess), Some(f)) = (
                 self.session.as_ref().map(|s| s.session_id.clone()),
                 self.selected_func().cloned(),
@@ -317,6 +430,39 @@ impl AletheiaApp {
             }
         }
     }
+
+    fn xref_row_ui(&mut self, ui: &mut egui::Ui, t: Tokens, row: &XrefRow, jump_va: u64, dir: &str) {
+        let label = row
+            .label
+            .as_deref()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("0x{jump_va:x}"));
+        let text = format!(
+            "{dir} 0x{:x} → 0x{:x}  {}  {}",
+            row.from, row.to, row.kind, label
+        );
+        let resp = ui.add(
+            egui::Label::new(
+                egui::RichText::new(text)
+                    .monospace()
+                    .size(11.0)
+                    .color(t.sx_reg),
+            )
+            .sense(egui::Sense::click()),
+        );
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            self.navigate_to_va(jump_va, true);
+            if self.center == CenterMode::Cfg {
+                // keep CFG; otherwise prefer listing for address jump
+            } else {
+                self.center = CenterMode::Listing;
+            }
+        }
+        resp.on_hover_text(format!("click → 0x{jump_va:x}  ( [ back )"));
+    }
 }
 
 impl eframe::App for AletheiaApp {
@@ -329,7 +475,6 @@ impl eframe::App for AletheiaApp {
         egui::TopBottomPanel::top("top").exact_height(40.0).show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.add_space(10.0);
-                // brand ember spark
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(11.0, 11.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 5.5, t.ember);
                 ui.label(
@@ -396,6 +541,16 @@ impl eframe::App for AletheiaApp {
                     {
                         self.pick_open(false);
                     }
+                    if !self.nav_stack.is_empty()
+                        && ui
+                            .add(egui::Button::new(
+                                egui::RichText::new(format!("← {}", self.nav_stack.len())).size(12.0),
+                            ))
+                            .on_hover_text("[ or Backspace — navigate back")
+                            .clicked()
+                    {
+                        self.nav_back();
+                    }
                 });
             });
         });
@@ -406,14 +561,17 @@ impl eframe::App for AletheiaApp {
                 ui.add_space(10.0);
                 mode_btn(ui, &mut self.center, CenterMode::Listing, "Listing", "u");
                 mode_btn(ui, &mut self.center, CenterMode::Decompile, "Decompile", "y");
+                mode_btn(ui, &mut self.center, CenterMode::Cfg, "CFG", "c");
                 mode_btn(ui, &mut self.center, CenterMode::Diff, "Diff", "⌘D");
                 mode_btn(ui, &mut self.center, CenterMode::Patch, "Patch", "p");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(10.0);
                     ui.label(
-                        egui::RichText::new("⌘K palette · g go · n rename · ? why · y/u toggle")
-                            .size(11.0)
-                            .color(t.ink3),
+                        egui::RichText::new(
+                            "⌘K · g go · n rename · c cfg · [ back · ? why · y/u toggle",
+                        )
+                        .size(11.0)
+                        .color(t.ink3),
                     );
                 });
             });
@@ -439,78 +597,82 @@ impl eframe::App for AletheiaApp {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.set_min_width(200.0);
-                egui::Frame::NONE
-                    .fill(t.panel2)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
+                egui::Frame::NONE.fill(t.panel2).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("FUNCTIONS")
+                                .size(10.0)
+                                .color(t.ink3)
+                                .strong(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
-                                egui::RichText::new("FUNCTIONS")
-                                    .size(10.0)
-                                    .color(t.ink3)
-                                    .strong(),
+                                egui::RichText::new(format!("{}", self.functions.len()))
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(t.ink3),
                             );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        });
+                    });
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .hint_text("filter…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(4.0);
+                    let indices = self.filtered_indices();
+                    egui::ScrollArea::vertical()
+                        .id_salt("nav_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for i in indices {
+                                let (va, source, label, trust, selected) = {
+                                    let f = &self.functions[i];
+                                    let trust = trust_for_source(&f.source);
+                                    let label = f
+                                        .name
+                                        .clone()
+                                        .unwrap_or_else(|| format!("sub_{:x}", f.va));
+                                    let selected = self.selected == Some(i);
+                                    (f.va, f.source.clone(), label, trust, selected)
+                                };
+                                let mut row = egui::RichText::new(format!(
+                                    "{}{}{}",
+                                    trust_dot_char(trust),
+                                    label,
+                                    trust.glyph()
+                                ))
+                                .monospace()
+                                .size(12.0)
+                                .color(if selected { t.ink } else { t.ink2 });
+                                if selected {
+                                    row = row.strong();
+                                }
+                                let resp = ui.selectable_label(selected, row);
+                                if resp.clicked() {
+                                    if let Some(cur) = self.selected_func().map(|f| f.va) {
+                                        if cur != va {
+                                            self.nav_stack.push(cur);
+                                        }
+                                    }
+                                    self.selected = Some(i);
+                                    self.focus_va = None;
+                                    self.load_selection();
+                                }
                                 ui.label(
-                                    egui::RichText::new(format!("{}", self.functions.len()))
+                                    egui::RichText::new(format!("  0x{va:x} · {source}"))
                                         .monospace()
-                                        .size(11.0)
+                                        .size(10.0)
                                         .color(t.ink3),
                                 );
-                            });
+                            }
                         });
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.filter)
-                                .hint_text("filter…")
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.add_space(4.0);
-                        let indices = self.filtered_indices();
-                        egui::ScrollArea::vertical()
-                            .id_salt("nav_scroll")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for i in indices {
-                                    let (va, source, label, trust, selected) = {
-                                        let f = &self.functions[i];
-                                        let trust = trust_for_source(&f.source);
-                                        let label = f
-                                            .name
-                                            .clone()
-                                            .unwrap_or_else(|| format!("sub_{:x}", f.va));
-                                        let selected = self.selected == Some(i);
-                                        (f.va, f.source.clone(), label, trust, selected)
-                                    };
-                                    let mut row = egui::RichText::new(format!(
-                                        "{}{}{}",
-                                        trust_dot_char(trust),
-                                        label,
-                                        trust.glyph()
-                                    ))
-                                    .monospace()
-                                    .size(12.0)
-                                    .color(if selected { t.ink } else { t.ink2 });
-                                    if selected {
-                                        row = row.strong();
-                                    }
-                                    let resp = ui.selectable_label(selected, row);
-                                    if resp.clicked() {
-                                        self.selected = Some(i);
-                                        self.load_selection();
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(format!("  0x{va:x} · {source}"))
-                                            .monospace()
-                                            .size(10.0)
-                                            .color(t.ink3),
-                                    );
-                                }
-                            });
-                    });
+                });
             });
 
         // ——— Right context ———
         egui::SidePanel::right("ctx")
-            .exact_width(300.0)
+            .exact_width(320.0)
             .resizable(true)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -553,22 +715,37 @@ impl eframe::App for AletheiaApp {
                     ui.add_space(10.0);
                     section_header(ui, t, "XREFS");
                     ui.label(
-                        egui::RichText::new(format!("total {}", self.xrefs.total))
+                        egui::RichText::new(format!(
+                            "total {} · click jumps · [ back",
+                            self.xrefs.total
+                        ))
+                        .size(10.0)
+                        .color(t.ink3),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format!("from ({})", self.xrefs.from.len()))
                             .size(10.0)
+                            .strong()
                             .color(t.ink3),
                     );
+                    // Outgoing: jump to target (`to`).
+                    let from_rows = self.xrefs.from.clone();
+                    for row in &from_rows {
+                        self.xref_row_ui(ui, t, row, row.to, "→");
+                    }
+                    ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new(format!("from {}", compact_json(&self.xrefs.from)))
-                            .monospace()
-                            .size(10.5)
-                            .color(t.sx_reg),
+                        egui::RichText::new(format!("to ({})", self.xrefs.to.len()))
+                            .size(10.0)
+                            .strong()
+                            .color(t.ink3),
                     );
-                    ui.label(
-                        egui::RichText::new(format!("to   {}", compact_json(&self.xrefs.to)))
-                            .monospace()
-                            .size(10.5)
-                            .color(t.sx_reg),
-                    );
+                    // Incoming: jump to source (`from`).
+                    let to_rows = self.xrefs.to.clone();
+                    for row in &to_rows {
+                        self.xref_row_ui(ui, t, row, row.from, "←");
+                    }
 
                     ui.add_space(10.0);
                     section_header(ui, t, "ANNOTATIONS");
@@ -583,7 +760,7 @@ impl eframe::App for AletheiaApp {
                             .color(t.asserted),
                         );
                         ui.label(
-                            egui::RichText::new("n rename · asserted → annotate::Db")
+                            egui::RichText::new("n rename · delta on wire · no full reload")
                                 .size(10.0)
                                 .color(t.ink3),
                         );
@@ -593,12 +770,6 @@ impl eframe::App for AletheiaApp {
 
         // ——— Center ———
         egui::CentralPanel::default().show(ctx, |ui| {
-            let body = match self.center {
-                CenterMode::Listing => self.listing.as_str(),
-                CenterMode::Decompile => self.decompile.as_str(),
-                CenterMode::Diff => self.diff.report.as_str(),
-                CenterMode::Patch => self.patch_report.as_str(),
-            };
             if self.center == CenterMode::Diff {
                 ui.horizontal(|ui| {
                     bucket(ui, t, "unchanged", self.diff.unchanged, t.d_unchanged);
@@ -611,13 +782,66 @@ impl eframe::App for AletheiaApp {
                 ui.add_space(6.0);
                 if !self.diff.hunks_blob.is_empty() {
                     ui.label(
-                        egui::RichText::new(format!("patch hunks: {}", compact_json(&self.diff.hunks_blob)))
-                            .monospace()
-                            .size(11.0)
-                            .color(t.ink3),
+                        egui::RichText::new(format!(
+                            "patch hunks: {}",
+                            compact_json(&self.diff.hunks_blob)
+                        ))
+                        .monospace()
+                        .size(11.0)
+                        .color(t.ink3),
                     );
                 }
             }
+
+            if self.center == CenterMode::Cfg {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.cfg_info.blocks.is_empty() {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Select a function · press c for CFG (engine edges only)",
+                                    )
+                                    .size(14.0)
+                                    .color(t.ink3),
+                                );
+                            });
+                        } else {
+                            let name = self
+                                .cfg_info
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("sub_{:x}", self.cfg_info.entry));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "CFG  {name} @ 0x{:x}",
+                                    self.cfg_info.entry
+                                ))
+                                .monospace()
+                                .strong()
+                                .size(13.0)
+                                .color(t.ink),
+                            );
+                            ui.add_space(6.0);
+                            let focus = self.focus_va;
+                            if let Some(block) = cfg_view::show(ui, t, &self.cfg_info, focus) {
+                                self.focus_va = Some(block);
+                                self.center = CenterMode::Listing;
+                                self.status = format!("CFG block → 0x{block:x}");
+                            }
+                        }
+                    });
+                return;
+            }
+
+            let body = match self.center {
+                CenterMode::Listing => self.listing.as_str(),
+                CenterMode::Decompile => self.decompile.as_str(),
+                CenterMode::Diff => self.diff.report.as_str(),
+                CenterMode::Patch => self.patch_report.as_str(),
+                CenterMode::Cfg => "",
+            };
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -625,14 +849,13 @@ impl eframe::App for AletheiaApp {
                         ui.centered_and_justified(|ui| {
                             ui.label(
                                 egui::RichText::new(
-                                    "Open a fixture (⌘O) → select a function → Listing / Decompile",
+                                    "Open a fixture (⌘O) → select a function → Listing / Decompile / CFG",
                                 )
                                 .size(14.0)
                                 .color(t.ink3),
                             );
                         });
                     } else {
-                        // Monospace listing / pseudo — dense RE surface
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(body)
@@ -650,7 +873,7 @@ impl eframe::App for AletheiaApp {
         // ——— Modals ———
         match self.modal {
             Modal::Rename => self.show_modal(ctx, "Rename", |s, ui| {
-                ui.label("Asserted name → annotate::Db (protocol rename)");
+                ui.label("Asserted name → annotate::Db (protocol rename + delta)");
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut s.rename_buf)
                         .font(egui::TextStyle::Monospace)
@@ -676,7 +899,7 @@ impl eframe::App for AletheiaApp {
             Modal::Palette => self.show_modal(ctx, "Command palette", |s, ui| {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut s.palette_buf)
-                        .hint_text("open · diff · listing · decompile · rename · why · patch")
+                        .hint_text("open · diff · listing · decompile · cfg · rename · why · patch · back")
                         .desired_width(400.0),
                 );
                 resp.request_focus();
@@ -688,6 +911,8 @@ impl eframe::App for AletheiaApp {
                         "diff" => s.pick_open(true),
                         "listing" | "u" => s.center = CenterMode::Listing,
                         "decompile" | "y" => s.center = CenterMode::Decompile,
+                        "cfg" | "c" => s.center = CenterMode::Cfg,
+                        "back" | "[" => s.nav_back(),
                         "rename" | "n" => {
                             if let Some(f) = s.selected_func() {
                                 s.rename_buf = f.name.clone().unwrap_or_default();

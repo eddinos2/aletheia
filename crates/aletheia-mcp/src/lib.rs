@@ -13,9 +13,12 @@
 //!   {"id":10,"method":"patch_preview","params":{"session":"s1","va":"0x1000"}}
 //!   {"id":11,"method":"patch_apply","params":{"session":"s1","va":"0x1000"}}
 //!   {"id":12,"method":"why","params":{"session":"s1","va":"0x1000"}}
+//!   {"id":13,"method":"cfg","params":{"session":"s1","entry":"0x1000"}}
+//!   {"id":14,"method":"locate","params":{"session":"s1","va":"0x1000"}}
 //!
 //! Frontends compute nothing: they call [`handle_line`] (or the stdio binary)
-//! and render the engine's facts + provenance.
+//! and render the engine's facts + provenance. Rename responses carry a
+//! small `delta` so GUIs can patch navigator state without a full refetch.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,6 +84,8 @@ pub fn handle_line(state: &Arc<Mutex<State>>, line: &str) -> String {
         "patch_preview" => with_busy(state, id, || patch_preview(state, id, line)),
         "patch_apply" => with_busy(state, id, || patch_apply(state, id, line)),
         "why" => why(state, id, line),
+        "cfg" => with_busy(state, id, || cfg_method(state, id, line)),
+        "locate" => with_busy(state, id, || locate_method(state, id, line)),
         "cancel" => cancel(state, id),
         _ => json_err(id, &format!("unknown method `{method}`")),
     }
@@ -162,19 +167,29 @@ fn functions(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
         .into_iter()
         .map(|f| (f.va, f.source))
         .collect();
+    // Overlay asserted names from annotate::Db (same precedence as listing).
+    let index = aletheia::anchor::AnchorIndex::build(image.as_ref(), &program);
+    let mut asserted: BTreeMap<u64, String> = BTreeMap::new();
+    for placed in sess.db.resolve_onto(&index) {
+        if placed.field == annotate::Field::Name {
+            asserted.insert(placed.va, placed.value.to_string());
+        }
+    }
     let mut items = Vec::new();
     for (i, (&va, func)) in program.functions.iter().enumerate() {
         if i >= limit {
             break;
         }
-        let name = match &func.name {
-            Some(n) => format!(r#""{}""#, escape_json(n)),
-            None => "null".into(),
+        let (name, source) = if let Some(n) = asserted.get(&va) {
+            (format!(r#""{}""#, escape_json(n)), "asserted")
+        } else {
+            let name = match &func.name {
+                Some(n) => format!(r#""{}""#, escape_json(n)),
+                None => "null".into(),
+            };
+            let source = sources.get(&va).map(source_label).unwrap_or("cfg");
+            (name, source)
         };
-        let source = sources
-            .get(&va)
-            .map(source_label)
-            .unwrap_or("cfg");
         items.push(format!(
             r#"{{"va":"0x{va:x}","name":{name},"source":"{source}"}}"#
         ));
@@ -469,17 +484,177 @@ fn rename_method(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
             })
             .unwrap_or_else(|| "null".into());
         let hash = sess.hash;
-        Ok::<_, String>((tip, hash))
+        // Incremental delta: patch one navigator row; soft-invalidate
+        // views that embed the name (listing / why). Decompile text does
+        // not currently fold annotate names — still listed so clients can
+        // choose a clean refetch policy without guessing.
+        let delta = format!(
+            r#"{{"kind":"annotate","functions":[{{"va":"0x{va:x}","name":"{n}","source":"asserted"}}],"invalidate":[{{"view":"listing","va":"0x{va:x}"}},{{"view":"why","va":"0x{va:x}"}},{{"view":"decompile","va":"0x{va:x}"}}]}}"#,
+            n = escape_json(&name),
+        );
+        Ok::<_, String>((tip, delta, hash))
     })();
 
     match result {
-        Ok((tip, hash)) => json_ok(
+        Ok((tip, delta, hash)) => json_ok(
             id,
             &format!(
-                r#"{{"session_id":"{session}","tip":{tip},"stamp":{stamp}}}"#,
+                r#"{{"session_id":"{session}","tip":{tip},"delta":{delta},"stamp":{stamp}}}"#,
                 stamp = stamp_hash(hash),
             ),
         ),
+        Err(e) => json_err(id, &e),
+    }
+}
+
+/// Engine-owned CFG for one function: blocks + successor edges only.
+/// Frontends may lay out the graph; they must not invent edges.
+fn cfg_method(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
+    let session = match session_id(line) {
+        Some(s) => s,
+        None => return json_err(id, "cfg requires session"),
+    };
+    let entry = extract_string(line, "\"entry\"")
+        .and_then(|s| parse_hex(&s))
+        .or_else(|| extract_string(line, "\"va\"").and_then(|s| parse_hex(&s)))
+        .or_else(|| extract_number(line, "\"entry\""));
+    let Some(entry) = entry else {
+        return json_err(id, "cfg requires params.entry");
+    };
+
+    let result = (|| {
+        let st = state.lock().unwrap();
+        let sess = st
+            .sessions
+            .get(&session)
+            .ok_or_else(|| "unknown session".to_string())?;
+        let image = aletheia::load(&sess.data).map_err(|e| e.to_string())?;
+        let program = cfg::recover(image.as_ref()).map_err(|e| e.to_string())?;
+        let func = program
+            .functions
+            .get(&entry)
+            .ok_or_else(|| format!("no function at {entry:#x}"))?;
+        let mut blocks = Vec::new();
+        let mut edges = Vec::new();
+        for (&start, block) in &func.blocks {
+            let term = terminator_label(&block.terminator);
+            let succs: Vec<String> = block
+                .successors
+                .iter()
+                .map(|s| format!(r#""0x{s:x}""#))
+                .collect();
+            blocks.push(format!(
+                r#"{{"start":"0x{start:x}","end":"0x{:x}","terminator":"{term}","successors":[{}]}}"#,
+                block.end,
+                succs.join(","),
+            ));
+            for &to in &block.successors {
+                edges.push(format!(
+                    r#"{{"from":"0x{start:x}","to":"0x{to:x}"}}"#
+                ));
+            }
+        }
+        let name = match &func.name {
+            Some(n) => format!(r#""{}""#, escape_json(n)),
+            None => "null".into(),
+        };
+        Ok::<_, String>((
+            name,
+            blocks,
+            edges,
+            func.blocks.len(),
+            sess.hash,
+        ))
+    })();
+
+    match result {
+        Ok((name, blocks, edges, nblocks, hash)) => json_ok(
+            id,
+            &format!(
+                r#"{{"session_id":"{session}","entry":"0x{entry:x}","name":{name},"blocks":[{blocks}],"edges":[{edges}],"block_count":{nblocks},"stamp":{stamp}}}"#,
+                blocks = blocks.join(","),
+                edges = edges.join(","),
+                stamp = stamp_hash(hash),
+            ),
+        ),
+        Err(e) => json_err(id, &e),
+    }
+}
+
+/// Map an arbitrary VA to the recovered function / block that owns it.
+/// Used by xref click-navigation when the target is not a function entry.
+fn locate_method(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
+    let session = match session_id(line) {
+        Some(s) => s,
+        None => return json_err(id, "locate requires session"),
+    };
+    let va = extract_string(line, "\"va\"")
+        .and_then(|s| parse_hex(&s))
+        .or_else(|| extract_number(line, "\"va\""));
+    let Some(va) = va else {
+        return json_err(id, "locate requires params.va");
+    };
+
+    let result = (|| {
+        let st = state.lock().unwrap();
+        let sess = st
+            .sessions
+            .get(&session)
+            .ok_or_else(|| "unknown session".to_string())?;
+        let image = aletheia::load(&sess.data).map_err(|e| e.to_string())?;
+        let program = cfg::recover(image.as_ref()).map_err(|e| e.to_string())?;
+
+        // Exact entry wins.
+        if program.functions.contains_key(&va) {
+            let block = program.functions[&va]
+                .blocks
+                .get(&va)
+                .map(|b| b.start);
+            return Ok::<_, String>((
+                Some(va),
+                block,
+                true,
+                sess.hash,
+            ));
+        }
+
+        // Otherwise: first function (entry ascending) whose block range
+        // covers `va`. Engine fact only — no invented containing function.
+        let mut found_entry = None;
+        let mut found_block = None;
+        for (&entry, func) in &program.functions {
+            for (&start, block) in &func.blocks {
+                if va >= block.start && va < block.end {
+                    found_entry = Some(entry);
+                    found_block = Some(start);
+                    break;
+                }
+            }
+            if found_entry.is_some() {
+                break;
+            }
+        }
+        Ok::<_, String>((found_entry, found_block, false, sess.hash))
+    })();
+
+    match result {
+        Ok((func, block, exact_entry, hash)) => {
+            let func_json = match func {
+                Some(f) => format!(r#""0x{f:x}""#),
+                None => "null".into(),
+            };
+            let block_json = match block {
+                Some(b) => format!(r#""0x{b:x}""#),
+                None => "null".into(),
+            };
+            json_ok(
+                id,
+                &format!(
+                    r#"{{"session_id":"{session}","va":"0x{va:x}","function":{func_json},"block":{block_json},"exact_entry":{exact_entry},"stamp":{stamp}}}"#,
+                    stamp = stamp_hash(hash),
+                ),
+            )
+        }
         Err(e) => json_err(id, &e),
     }
 }
@@ -835,6 +1010,22 @@ fn source_label(source: &funcs::Source) -> &'static str {
     }
 }
 
+fn terminator_label(t: &cfg::Terminator) -> &'static str {
+    match t {
+        cfg::Terminator::Jump(_) => "jump",
+        cfg::Terminator::CondJump { .. } => "cond",
+        cfg::Terminator::IndirectJump { .. } => "ijmp",
+        cfg::Terminator::Call { .. } => "call",
+        cfg::Terminator::IndirectCall { .. } => "icall",
+        cfg::Terminator::Return => "ret",
+        cfg::Terminator::Interrupt { .. } => "int",
+        cfg::Terminator::Halt => "halt",
+        cfg::Terminator::Undecodable => "undec",
+        cfg::Terminator::Truncated => "trunc",
+        cfg::Terminator::FallThrough(_) => "fall",
+    }
+}
+
 fn looks_macho(data: &[u8]) -> bool {
     data.len() >= 4
         && matches!(
@@ -921,4 +1112,111 @@ fn parse_hex(s: &str) -> Option<u64> {
         .or_else(|| s.trim().strip_prefix("0X"))
         .unwrap_or(s.trim());
     u64::from_str_radix(s, 16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures")
+            .join(name)
+    }
+
+    fn open_diamond(state: &Arc<Mutex<State>>) -> String {
+        let path = fixture("diamond");
+        let line = format!(
+            r#"{{"id":1,"method":"open","params":{{"path":"{}"}}}}"#,
+            path.display()
+        );
+        let reply = handle_line(state, &line);
+        assert!(reply.contains(r#""ok":true"#), "{reply}");
+        extract_string(&reply, "\"session_id\"").expect("session_id")
+    }
+
+    #[test]
+    fn rename_returns_incremental_delta() {
+        let state = Arc::new(Mutex::new(State::new()));
+        let sid = open_diamond(&state);
+        let line = format!(
+            r#"{{"id":2,"method":"rename","params":{{"session":"{sid}","va":"0x1000003d0","name":"g1_renamed"}}}}"#
+        );
+        let reply = handle_line(&state, &line);
+        assert!(reply.contains(r#""ok":true"#), "{reply}");
+        assert!(reply.contains(r#""delta""#), "{reply}");
+        assert!(reply.contains(r#""kind":"annotate""#), "{reply}");
+        assert!(reply.contains(r#""source":"asserted""#), "{reply}");
+        assert!(reply.contains(r#""invalidate""#), "{reply}");
+        assert!(reply.contains("g1_renamed"), "{reply}");
+
+        // functions refetch must surface asserted name without inventing facts
+        let funcs = handle_line(
+            &state,
+            &format!(
+                r#"{{"id":3,"method":"functions","params":{{"session":"{sid}","limit":64}}}}"#
+            ),
+        );
+        assert!(funcs.contains("g1_renamed"), "{funcs}");
+        assert!(funcs.contains(r#""source":"asserted""#), "{funcs}");
+    }
+
+    #[test]
+    fn cfg_returns_engine_blocks_and_edges_only() {
+        let state = Arc::new(Mutex::new(State::new()));
+        let sid = open_diamond(&state);
+        let reply = handle_line(
+            &state,
+            &format!(
+                r#"{{"id":4,"method":"cfg","params":{{"session":"{sid}","entry":"0x1000003d0"}}}}"#
+            ),
+        );
+        assert!(reply.contains(r#""ok":true"#), "{reply}");
+        assert!(reply.contains(r#""blocks":["#), "{reply}");
+        assert!(reply.contains(r#""edges":["#), "{reply}");
+        assert!(reply.contains(r#""terminator""#), "{reply}");
+        // diamond has a branch → at least one cond/edge
+        assert!(reply.contains(r#""block_count""#), "{reply}");
+    }
+
+    #[test]
+    fn locate_maps_entry_and_interior_va() {
+        let state = Arc::new(Mutex::new(State::new()));
+        let sid = open_diamond(&state);
+        let entry = handle_line(
+            &state,
+            &format!(
+                r#"{{"id":5,"method":"locate","params":{{"session":"{sid}","va":"0x1000003d0"}}}}"#
+            ),
+        );
+        assert!(entry.contains(r#""exact_entry":true"#), "{entry}");
+        assert!(entry.contains(r#""function":"0x1000003d0""#), "{entry}");
+
+        // Interior byte of diamond (entry+4) should still resolve to the function.
+        let interior = handle_line(
+            &state,
+            &format!(
+                r#"{{"id":6,"method":"locate","params":{{"session":"{sid}","va":"0x1000003d4"}}}}"#
+            ),
+        );
+        assert!(interior.contains(r#""function":"0x1000003d0""#), "{interior}");
+        assert!(interior.contains(r#""exact_entry":false"#), "{interior}");
+    }
+
+    #[test]
+    fn xrefs_are_bidirectional_click_targets() {
+        let state = Arc::new(Mutex::new(State::new()));
+        let sid = open_diamond(&state);
+        // main calls diamond — refs_to(diamond) should include a from site.
+        let reply = handle_line(
+            &state,
+            &format!(
+                r#"{{"id":7,"method":"xrefs","params":{{"session":"{sid}","va":"0x1000003d0"}}}}"#
+            ),
+        );
+        assert!(reply.contains(r#""ok":true"#), "{reply}");
+        assert!(reply.contains(r#""from":["#) || reply.contains(r#""to":["#), "{reply}");
+        assert!(reply.contains(r#""kind""#), "{reply}");
+    }
 }

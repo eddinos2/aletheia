@@ -21,20 +21,23 @@ $ printf '%s\n' \
 Adjust `va` from the `functions` response. Expect: `ok:true`, non-empty
 `pseudocode`, and a `chain` with CLAIM/SOURCE/VERDICT on `why`.
 
-## B. GUI smoke (manual, ~2 min)
+## B. GUI smoke (manual, ~3 min)
 
 1. `cargo run -p aletheia-gui`
 2. ⌘O → `fixtures/diamond`
 3. Function list populates with trust marks (● proven / ○ heuristic)
-4. Select a named function → Listing shows symbolized disasm
+4. Select `_diamond` → Listing shows symbolized disasm
 5. Press `y` → Decompile pane shows pseudocode (`local_*` / sig header)
-6. Press `?` → Provenance pin shows CLAIM / SOURCE / VERDICT
-7. Press `n`, rename to `bench_renamed`, Enter → navigator updates (asserted)
-8. ⌘D → open `fixtures/shortcircuit` → Diff buckets + report
-9. Press `p` → Patch preview text for NOP-at-entry
+6. Press `c` → CFG shows layered blocks + successor edges only
+7. Press `?` → Provenance pin shows CLAIM / SOURCE / VERDICT
+8. In XREFS, click an incoming `to` row → jumps to caller; `[` returns
+9. Press `n`, rename to `bench_renamed`, Enter → navigator updates via
+   `delta` (status shows invalidate count; no full function-list reload)
+10. ⌘D → open `fixtures/shortcircuit` → Diff buckets + report
+11. Press `p` → Patch preview text for NOP-at-entry
 
-Pass if no panic, stamp visible in top bar, and rename survives a
-re-select of the same function in-session.
+Pass if no panic, stamp visible in top bar, CFG edges match engine
+successors, and rename survives a re-select of the same function.
 
 ## C. Packaging smoke (macOS)
 

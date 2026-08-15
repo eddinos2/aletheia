@@ -3,7 +3,8 @@
 Thin native workstation UI over the **same protocol** as `aletheia-mcp`
 ([protocol/PROTOCOL.md](../../protocol/PROTOCOL.md)). The GUI computes
 nothing: open / functions / listing / decompile / rename / why / xrefs /
-diff / patch_preview all go through `aletheia_mcp::handle_line`.
+cfg / locate / diff / patch_preview all go through
+`aletheia_mcp::handle_line`.
 
 Design north star: [DESIGN_GUI.md](../../DESIGN_GUI.md). Visual tokens
 match `design/aletheia-gui-mockup.html` (dark-first, trust channel,
@@ -23,10 +24,15 @@ Then **⌘O** and pick `fixtures/diamond` (or any PE/ELF/Mach-O).
 | ⌘D | Open second binary → Diff |
 | ⌘K | Command palette |
 | `g` | Go to address / symbol |
-| `n` | Rename (asserted → annotate log) |
+| `n` | Rename (asserted → annotate log + wire `delta`) |
 | `y` / `u` | Decompile / Listing toggle |
+| `c` | CFG graph (engine edges, layered layout) |
+| `[` / Backspace | Navigate back (xref / go-to stack) |
 | `?` | Pin provenance (Why?) |
 | `p` | Patch preview (NOP recipe at entry) |
+
+Click an xref row in the right panel: outgoing jumps to `to`, incoming
+jumps to `from` (via protocol `locate` when the VA is not an entry).
 
 ## Architecture
 
@@ -47,7 +53,8 @@ $ ./scripts/macos-dmg.sh --release   # → dist/Aletheia-*-unsigned.dmg
 ```
 
 Requires macOS + Xcode CLT. Builds are **ad-hoc signed / unsigned** for
-local use. Distribution notarization needs an Apple Developer ID:
+local use (no Developer ID required). Distribution notarization needs an
+Apple Developer ID:
 
 1. `codesign --deep --force --options runtime --sign "Developer ID Application: …" dist/Aletheia.app`
 2. Package DMG, then `xcrun notarytool submit … --wait`
@@ -55,6 +62,6 @@ local use. Distribution notarization needs an Apple Developer ID:
 
 ## Gate G1 status
 
-Shipped here: navigate · rename · Why? · decompile toggle · diff buckets ·
-patch preview — all over protocol. Remaining polish (CFG graph, richer
-xref click-nav, incremental deltas) is tracked in [GATES.md](../../GATES.md).
+All G1 bullets green: navigate · rename · Why? · decompile · bidirectional
+xref click-nav · CFG graph · incremental rename deltas — tracked in
+[GATES.md](../../GATES.md).

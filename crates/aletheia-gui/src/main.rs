@@ -6,6 +6,7 @@
 #![allow(clippy::collapsible_if)]
 
 mod app;
+mod cfg_view;
 mod client;
 mod theme;
 

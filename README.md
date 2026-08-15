@@ -45,7 +45,7 @@ patch/diff) while staying clean-room and open.
 | Open FLIRT-style matcher (`--flirt`) | Early |
 | PatchSet + patch-from-diff | Working |
 | MCP server (`aletheia-mcp`) | Agent entry point |
-| Native GUI (`aletheia-gui`) | MVP workstation (protocol-thin) |
+| Native GUI (`aletheia-gui`) | Gate G1 workstation (xref nav, CFG, deltas) |
 | Headless `--json` | Functions list |
 | macOS `.app` / `.dmg` scripts | Unsigned local packaging |
 
@@ -62,8 +62,9 @@ $ cargo run -p aletheia-gui
 
 Agent loop (MCP): `open` → `decompile` / `diff` / `listing` / `patch_preview` → `rename`.
 
-GUI loop: ⌘O → select function → `y` decompile / `n` rename / `?` Why? —
-same protocol as agents. See [crates/aletheia-gui/README.md](crates/aletheia-gui/README.md).
+GUI loop: ⌘O → select function → `y` decompile / `c` CFG / click xrefs /
+`n` rename (delta) / `?` Why? — same protocol as agents. See
+[crates/aletheia-gui/README.md](crates/aletheia-gui/README.md).
 
 ### MCP headless smoke
 
