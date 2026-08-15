@@ -57,7 +57,7 @@ and Apple/iOS support over time.
 | **Engine** | irstack, sig, MEM promote, irtype evidence, boolmerge | type bounds → presentation; FLIRT corpus growth |
 | **iOS / Apple** | chained walk, ObjC classes/methods, Swift metadata stub | deeper Swift ABI; selector xrefs |
 | **Patch / Diff** | PatchSet, patch-from-diff, resign recipe stub | richer assemble; codesign recipe depth |
-| **Agents / UI** | MCP protocol fill, `--json` | TUI (Gate G1) → GUI |
+| **Agents / UI** | MCP protocol fill, `--json`, **GUI MVP** (`aletheia-gui`) | Gate G1 polish (xref nav, CFG graph, deltas) |
 
 Gates: see [GATES.md](GATES.md).
 
@@ -72,7 +72,7 @@ Loaders, decoders, CFG/funcs/xrefs, parallel engine, open annotations.
 - [x] Symbolized listing (`redump --listing`)
 - [x] MCP server (`aletheia-mcp`: open/decompile/diff/patch/listing/stack/xrefs/rename)
 - [x] Headless `--json` (functions)
-- [ ] TUI explorer
+- [x] Native GUI MVP (`aletheia-gui` — protocol-isomorphic with MCP)
 - [ ] Stable scripting / plugin ABI
 
 ### Phase 5 — Differentiators + decompiler — in progress
@@ -86,9 +86,12 @@ Loaders, decoders, CFG/funcs/xrefs, parallel engine, open annotations.
 - [x] PatchSet preview/apply + patch-from-diff
 - [x] ObjC / Swift early recoveries
 
-### Phase 6 — Poly-frontend — planned
+### Phase 6 — Poly-frontend — in progress
 
 Engine owns truth; GUI/TUI/MCP compute nothing. See [DESIGN_GUI.md](DESIGN_GUI.md).
+Native GUI MVP lands Gate G1 core (navigate / rename / Why? / decompile).
+Packaging: [crates/aletheia-gui/README.md](crates/aletheia-gui/README.md).
+Bench checklist: [docs/GUI_BENCH_CHECKLIST.md](docs/GUI_BENCH_CHECKLIST.md).
 
 ## Quality bar
 

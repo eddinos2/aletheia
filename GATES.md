@@ -33,6 +33,13 @@ into `redump --decompile` and `aletheia-mcp` decompile.
       `why` tools (progress/cancel stubs)
 - [x] Agent can decompile without GUI (manual smoke via stdio JSON)
 
-## Gate G1 — TUI
+## Gate G1 — GUI / protocol surface
 
-- [ ] Navigate + rename + Why? + decompile toggle over protocol
+- [x] Navigate + rename + Why? + decompile toggle over protocol
+      (`aletheia-gui` → `aletheia_mcp::handle_line`)
+- [ ] Richer xref click-navigation + CFG graph layout (frontend-only)
+- [ ] Incremental analysis deltas on the wire
+
+**MVP shipped:** three-region egui workstation, trust channel, diff buckets,
+patch preview, macOS `.app`/`.dmg` scripts. Checklist:
+[docs/GUI_BENCH_CHECKLIST.md](docs/GUI_BENCH_CHECKLIST.md).

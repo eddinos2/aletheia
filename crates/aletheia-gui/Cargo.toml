@@ -1,0 +1,32 @@
+[package]
+name = "aletheia-gui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Native Aletheia workstation GUI — thin client over the shared protocol"
+publish = false
+repository = "https://github.com/eddinos2/aletheia"
+
+[[bin]]
+name = "aletheia-gui"
+path = "src/main.rs"
+
+[dependencies]
+aletheia-mcp = { path = "../aletheia-mcp" }
+eframe = { version = "0.31", default-features = true, features = ["default_fonts"] }
+egui = "0.31"
+rfd = "0.15"
+
+# cargo-bundle metadata for `cargo bundle --release` (optional; scripts/ also
+# produce an .app without the plugin).
+[package.metadata.bundle]
+name = "Aletheia"
+identifier = "org.aletheia.gui"
+short_description = "Open agent-native reverse-engineering workstation"
+long_description = """
+Aletheia is an open binary-analysis toolkit. This GUI is a thin client over
+the same protocol used by aletheia-mcp agents: listing, decompile, rename,
+provenance (Why?), diff, and patch preview.
+"""
+category = "Developer Tool"
+osx_info_plist_exts = []

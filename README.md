@@ -45,8 +45,9 @@ patch/diff) while staying clean-room and open.
 | Open FLIRT-style matcher (`--flirt`) | Early |
 | PatchSet + patch-from-diff | Working |
 | MCP server (`aletheia-mcp`) | Agent entry point |
+| Native GUI (`aletheia-gui`) | MVP workstation (protocol-thin) |
 | Headless `--json` | Functions list |
-| GUI / TUI | Spec only (Gate G1 open) |
+| macOS `.app` / `.dmg` scripts | Unsigned local packaging |
 
 ```console
 $ cargo run --bin redump -- ./target
@@ -56,9 +57,13 @@ $ cargo run --bin redump -- old.bin --diff new.bin
 $ cargo run --bin redump -- old.bin --patch-from-diff new.bin
 $ cargo run --bin redump -- ./app --json
 $ cargo run -p aletheia-mcp
+$ cargo run -p aletheia-gui
 ```
 
 Agent loop (MCP): `open` → `decompile` / `diff` / `listing` / `patch_preview` → `rename`.
+
+GUI loop: ⌘O → select function → `y` decompile / `n` rename / `?` Why? —
+same protocol as agents. See [crates/aletheia-gui/README.md](crates/aletheia-gui/README.md).
 
 ### MCP headless smoke
 
@@ -69,7 +74,14 @@ With `aletheia-mcp` on `PATH` (or via `cargo run -p aletheia-mcp`):
 3. Call `decompile` on a known function index and confirm non-empty pseudocode.
 4. Optional: `why` on the same address to verify provenance text.
 
-This is the Gate M1 manual smoke until the TUI lands — no GUI required.
+Full GUI + engine checklist: [docs/GUI_BENCH_CHECKLIST.md](docs/GUI_BENCH_CHECKLIST.md).
+
+### macOS package (unsigned)
+
+```console
+$ ./scripts/macos-app.sh --release
+$ ./scripts/macos-dmg.sh --release
+```
 
 
 ## Design principles

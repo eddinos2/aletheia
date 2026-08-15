@@ -3,8 +3,12 @@ name = "aletheia-mcp"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "MCP stdio server: agent automation for Aletheia reverse-engineering workflows"
+description = "Aletheia protocol dispatch + MCP stdio server for agent automation"
 publish = false
+
+[lib]
+name = "aletheia_mcp"
+path = "src/lib.rs"
 
 [[bin]]
 name = "aletheia-mcp"

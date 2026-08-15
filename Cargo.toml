@@ -1,6 +1,7 @@
 [workspace]
-members = [".", "crates/aletheia-mcp"]
+members = [".", "crates/aletheia-mcp", "crates/aletheia-gui"]
 resolver = "3"
+default-members = [".", "crates/aletheia-mcp"]
 
 [package]
 name = "aletheia"
