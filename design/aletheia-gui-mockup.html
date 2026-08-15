@@ -1,0 +1,597 @@
+<title>Aletheia Workspace</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* ============================================================
+     TOKENS — light is the bare :root; dark overrides only tokens.
+     Two orthogonal semantic axes: TRUST (proven/heuristic/asserted)
+     and DIFF (six buckets). Kept in distinct hue sets on purpose.
+     ============================================================ */
+  :root{
+    --ground:#eef1f6; --panel:#ffffff; --panel-2:#e7ecf3; --panel-3:#dde3ec;
+    --line:#d3dae4; --line-strong:#b9c2d0;
+    --ink:#17202e; --ink-2:#525d6d; --ink-3:#8590a0;
+    --accent:#0c8f88; --ember:#c2410c;
+    /* trust axis */
+    --proven:#0c8f88; --heuristic:#b45309; --asserted:#5b4bd0;
+    --proven-bg:rgba(12,143,136,.10); --heuristic-bg:rgba(180,83,9,.10); --asserted-bg:rgba(91,75,208,.10);
+    /* diff axis */
+    --d-unchanged:#8590a0; --d-moved:#2563eb; --d-modified:#c2680c;
+    --d-uncertain:#b45309; --d-added:#15803d; --d-removed:#d6293a;
+    /* syntax */
+    --sx-mn:#17202e; --sx-reg:#215f8a; --sx-imm:#9a5b00; --sx-str:#2f7d43;
+    --sx-addr:#7a8494; --sx-cmt:#9aa4b2; --sx-dir:#8a5cc4;
+    --shadow:0 8px 30px rgba(20,30,50,.16);
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#0b0e14; --panel:#10141d; --panel-2:#161c27; --panel-3:#1c2431;
+      --line:#232b38; --line-strong:#323c4c;
+      --ink:#cdd5e0; --ink-2:#8b96a6; --ink-3:#5c6675;
+      --accent:#35c4b5; --ember:#f0703a;
+      --proven:#2fbfae; --heuristic:#e0a44a; --asserted:#9a8cf0;
+      --proven-bg:rgba(47,191,174,.13); --heuristic-bg:rgba(224,164,74,.14); --asserted-bg:rgba(154,140,240,.14);
+      --d-unchanged:#5c6675; --d-moved:#4c8dff; --d-modified:#e0803a;
+      --d-uncertain:#e0a44a; --d-added:#57c66b; --d-removed:#ef5f6b;
+      --sx-mn:#cdd5e0; --sx-reg:#7fb3d5; --sx-imm:#cfa06a; --sx-str:#8fbf7f;
+      --sx-addr:#6b7686; --sx-cmt:#5c6675; --sx-dir:#b79cf0;
+      --shadow:0 10px 34px rgba(0,0,0,.5);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#0b0e14; --panel:#10141d; --panel-2:#161c27; --panel-3:#1c2431;
+    --line:#232b38; --line-strong:#323c4c;
+    --ink:#cdd5e0; --ink-2:#8b96a6; --ink-3:#5c6675;
+    --accent:#35c4b5; --ember:#f0703a;
+    --proven:#2fbfae; --heuristic:#e0a44a; --asserted:#9a8cf0;
+    --proven-bg:rgba(47,191,174,.13); --heuristic-bg:rgba(224,164,74,.14); --asserted-bg:rgba(154,140,240,.14);
+    --d-unchanged:#5c6675; --d-moved:#4c8dff; --d-modified:#e0803a;
+    --d-uncertain:#e0a44a; --d-added:#57c66b; --d-removed:#ef5f6b;
+    --sx-mn:#cdd5e0; --sx-reg:#7fb3d5; --sx-imm:#cfa06a; --sx-str:#8fbf7f;
+    --sx-addr:#6b7686; --sx-cmt:#5c6675; --sx-dir:#b79cf0;
+    --shadow:0 10px 34px rgba(0,0,0,.5);
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  :root{
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  body{
+    background:var(--ground); color:var(--ink);
+    font-family:var(--sans); font-size:13px; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+    font-variant-numeric:tabular-nums;
+  }
+  .mono{font-family:var(--mono)}
+  .eyebrow{font-size:10px; letter-spacing:.13em; text-transform:uppercase; color:var(--ink-3); font-weight:600}
+  a{color:var(--accent)}
+  ::selection{background:var(--accent); color:var(--ground)}
+  :focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:3px}
+  button{font-family:inherit; cursor:pointer}
+
+  /* ---------- shell ---------- */
+  .app{max-width:1400px; margin:0 auto; min-height:100dvh; display:flex; flex-direction:column;
+       border-left:1px solid var(--line); border-right:1px solid var(--line); background:var(--panel)}
+
+  /* top bar */
+  .topbar{display:flex; align-items:center; gap:16px; padding:9px 16px; border-bottom:1px solid var(--line);
+          background:var(--panel-2)}
+  .brand{display:flex; align-items:center; gap:9px; font-weight:700; letter-spacing:-.01em; font-size:14px}
+  .spark{width:11px; height:11px; border-radius:50%;
+         background:radial-gradient(circle at 35% 30%, #ffd9a0, var(--ember) 60%, #7a1f05);
+         box-shadow:0 0 10px 1px color-mix(in srgb, var(--ember) 55%, transparent)}
+  .bin{display:flex; align-items:center; gap:8px; font-family:var(--mono); font-size:12px; color:var(--ink-2)}
+  .bin b{color:var(--ink); font-weight:600}
+  .tag{border:1px solid var(--line-strong); border-radius:4px; padding:1px 6px; font-size:11px; color:var(--ink-2)}
+  .stamp{margin-left:auto; display:flex; align-items:center; gap:7px; font-family:var(--mono); font-size:11px; color:var(--ink-2);
+         background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:4px 9px}
+  .stamp .ok{width:7px;height:7px;border-radius:50%;background:var(--proven);box-shadow:0 0 0 3px var(--proven-bg)}
+  .tbtn{background:var(--panel); border:1px solid var(--line); color:var(--ink-2); border-radius:6px; padding:5px 9px; font-size:12px; display:flex; align-items:center; gap:6px}
+  .tbtn:hover{border-color:var(--line-strong); color:var(--ink)}
+
+  /* view switch + mockup ribbon */
+  .subbar{display:flex; align-items:center; gap:6px; padding:7px 16px; border-bottom:1px solid var(--line); background:var(--panel)}
+  .seg{display:inline-flex; background:var(--panel-2); border:1px solid var(--line); border-radius:7px; padding:2px}
+  .seg button{background:transparent; border:0; color:var(--ink-2); padding:5px 12px; border-radius:5px; font-size:12px; font-weight:600}
+  .seg button[aria-selected="true"]{background:var(--panel); color:var(--ink); box-shadow:0 1px 2px rgba(0,0,0,.15)}
+  .ribbon{margin-left:auto; display:flex; align-items:center; gap:7px; font-size:11px; color:var(--ink-2);
+          background:var(--heuristic-bg); border:1px solid color-mix(in srgb,var(--heuristic) 35%,transparent);
+          border-radius:20px; padding:3px 11px}
+  .ribbon .dot{width:6px;height:6px;border-radius:50%;background:var(--heuristic)}
+
+  /* main grid */
+  .work{display:grid; grid-template-columns:246px minmax(0,1fr) 320px; flex:1; min-height:0}
+  .col{min-width:0; display:flex; flex-direction:column; min-height:0}
+  .col.nav{border-right:1px solid var(--line); background:var(--panel-2)}
+  .col.ctx{border-left:1px solid var(--line); background:var(--panel-2)}
+  .panel-h{display:flex; align-items:center; gap:8px; padding:9px 13px; border-bottom:1px solid var(--line)}
+  .panel-h .count{margin-left:auto; font-family:var(--mono); font-size:11px; color:var(--ink-3)}
+  .scroll{overflow:auto; min-height:0}
+
+  /* trust marks (shape + color + glyph; never color alone) */
+  .tm{display:inline-block; width:9px; height:9px; border-radius:50%; flex:none; position:relative; top:1px}
+  .tm.proven{background:var(--proven)}
+  .tm.heuristic{background:transparent; border:1.5px dashed var(--heuristic)}
+  .tm.asserted{background:transparent; border:1.5px solid var(--asserted);
+    box-shadow:inset 0 0 0 2px color-mix(in srgb,var(--asserted) 55%,transparent)}
+  .qmark{color:var(--heuristic); font-weight:700}
+  .pen{color:var(--asserted); font-size:11px}
+
+  /* navigator */
+  .nav-group{padding:11px 13px 3px; display:flex; align-items:center; gap:7px}
+  .nav-group .eyebrow{display:flex; align-items:center; gap:6px}
+  .nav-group .n{margin-left:auto; font-family:var(--mono); font-size:10px; color:var(--ink-3)}
+  .frow{display:flex; align-items:center; gap:8px; padding:4px 13px; font-family:var(--mono); font-size:12px; color:var(--ink-2); border-left:2px solid transparent}
+  .frow:hover{background:var(--panel-3); color:var(--ink)}
+  .frow.active{background:var(--panel); color:var(--ink); border-left-color:var(--accent)}
+  .frow .fa{margin-left:auto; color:var(--ink-3); font-size:10.5px}
+  .frow .nm{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+
+  /* listing */
+  .tabs{display:flex; gap:2px; padding:6px 10px 0; border-bottom:1px solid var(--line); background:var(--panel)}
+  .tab{background:transparent; border:1px solid transparent; border-bottom:0; color:var(--ink-2); padding:6px 12px;
+       font-size:12px; font-weight:600; border-radius:6px 6px 0 0}
+  .tab[aria-selected="true"]{background:var(--panel-2); color:var(--ink); border-color:var(--line)}
+  .tab[disabled]{color:var(--ink-3); cursor:not-allowed; opacity:.65}
+  .tab .mini{font-size:9px; letter-spacing:.06em; text-transform:uppercase; color:var(--heuristic); margin-left:6px; font-weight:700}
+
+  .listing{font-family:var(--mono); font-size:12.5px; line-height:1.62; padding:8px 0 40px}
+  .fnhead{padding:14px 16px 8px; border-top:1px solid var(--line); margin-top:6px}
+  .fnhead:first-child{border-top:0; margin-top:0}
+  .fnhead .sig{color:var(--ink); font-weight:600}
+  .fnhead .ret{color:var(--sx-reg)}
+  .fnhead .fnm{color:var(--asserted)}
+  .fnhead .why{margin-left:8px}
+  .xline{padding:2px 16px 8px; color:var(--ink-3); font-size:11.5px; font-family:var(--mono)}
+  .xline a{color:var(--sx-reg); text-decoration:none}
+  .xline a:hover{text-decoration:underline}
+
+  .ins{display:grid; grid-template-columns:150px 132px 1fr; gap:0; padding:1px 16px; white-space:pre; align-items:baseline}
+  .ins:hover{background:var(--panel-2)}
+  .ins.sel{background:var(--proven-bg); box-shadow:inset 2px 0 0 var(--proven)}
+  .addr{color:var(--sx-addr)}
+  .bytes{color:var(--ink-3)}
+  .asm .mn{color:var(--sx-mn); font-weight:600}
+  .asm .reg{color:var(--sx-reg)}
+  .asm .imm{color:var(--sx-imm)}
+  .asm .cmt{color:var(--sx-cmt)}
+  .asm .str{color:var(--sx-str)}
+  .asm .sym{color:var(--accent)}
+  .asm .lbl{color:var(--sx-dir)}
+  .raw .mn{color:var(--ink-3); font-weight:600; font-style:italic}
+  .raw{background:repeating-linear-gradient(135deg,transparent,transparent 7px,color-mix(in srgb,var(--ink-3) 7%,transparent) 7px,color-mix(in srgb,var(--ink-3) 7%,transparent) 8px)}
+  .why{font-size:10px; font-family:var(--sans); color:var(--ink-3); border:1px solid var(--line); background:var(--panel);
+       border-radius:4px; padding:0 5px; cursor:pointer; letter-spacing:.02em}
+  .why:hover{color:var(--accent); border-color:var(--accent)}
+  .op-trust{display:inline-flex; align-items:center; gap:5px}
+
+  .footer-note{padding:10px 16px; color:var(--ink-3); font-family:var(--mono); font-size:11px; border-top:1px dashed var(--line); margin-top:10px}
+
+  /* context rail cards */
+  .card{border-bottom:1px solid var(--line)}
+  .card .body{padding:11px 13px; display:flex; flex-direction:column; gap:9px}
+  .xref{display:grid; grid-template-columns:auto 1fr auto; gap:8px; align-items:center; font-family:var(--mono); font-size:11.5px}
+  .xref .k{color:var(--ink-3); font-size:10px; text-transform:uppercase; letter-spacing:.05em; font-family:var(--sans); font-weight:600}
+  .xref a{color:var(--sx-reg); text-decoration:none}
+  .xref .ea{color:var(--sx-addr)}
+  .xtier{font-size:9px; padding:1px 5px; border-radius:4px; font-family:var(--sans); font-weight:700; letter-spacing:.04em}
+  .xtier.exact{color:var(--proven); background:var(--proven-bg)}
+  .xtier.heur{color:var(--heuristic); background:var(--heuristic-bg)}
+
+  /* provenance chain */
+  .prov{font-family:var(--mono); font-size:11.5px; display:flex; flex-direction:column; gap:0; border:1px solid var(--line); border-radius:8px; overflow:hidden}
+  .prov .row{display:grid; grid-template-columns:78px 1fr; gap:10px; padding:8px 11px; border-bottom:1px solid var(--line)}
+  .prov .row:last-child{border-bottom:0}
+  .prov .lab{color:var(--ink-3); font-size:9.5px; letter-spacing:.06em; text-transform:uppercase; font-family:var(--sans); font-weight:700; padding-top:1px}
+  .prov .val{color:var(--ink-2); word-break:break-word}
+  .prov .val b{color:var(--ink); font-weight:600}
+  .prov .val .hex{color:var(--sx-imm)}
+  .prov .row.verdict{background:var(--proven-bg)}
+  .prov .row.verdict .val{color:var(--proven); font-weight:700}
+  .prov .row.neg .val{color:var(--heuristic)}
+  .prov .row.verdict.heur{background:var(--heuristic-bg)}
+  .prov .row.verdict.heur .val{color:var(--heuristic)}
+  .badge{display:inline-flex; align-items:center; gap:6px; font-family:var(--sans); font-weight:700; font-size:11px; padding:3px 9px; border-radius:20px}
+  .badge.proven{color:var(--proven); background:var(--proven-bg)}
+  .badge.heuristic{color:var(--heuristic); background:var(--heuristic-bg)}
+  .badge.asserted{color:var(--asserted); background:var(--asserted-bg)}
+
+  .annot{display:flex; flex-direction:column; gap:2px; font-family:var(--mono); font-size:11.5px}
+  .annot .r{display:grid; grid-template-columns:56px 1fr; gap:8px; padding:3px 0}
+  .annot .f{color:var(--ink-3); font-size:9.5px; text-transform:uppercase; letter-spacing:.05em; font-family:var(--sans); font-weight:700; padding-top:2px}
+  .annot .v{color:var(--ink)}
+  .logline{color:var(--ink-3); font-size:10.5px; font-family:var(--mono); display:flex; align-items:center; gap:6px; margin-top:2px}
+
+  /* status strip */
+  .status{display:flex; align-items:center; gap:14px; padding:6px 16px; border-top:1px solid var(--line); background:var(--panel-2); font-size:11px; color:var(--ink-2)}
+  .status .legend{margin-left:auto; display:flex; align-items:center; gap:14px; flex-wrap:wrap}
+  .status .li{display:inline-flex; align-items:center; gap:6px}
+  .caps-ok{color:var(--proven)}
+
+  /* ---------- diff view ---------- */
+  .diffwrap{padding:16px; display:flex; flex-direction:column; gap:14px; overflow:auto}
+  .diffhead{display:flex; align-items:baseline; gap:12px; flex-wrap:wrap}
+  .diffhead .vs{font-family:var(--mono); color:var(--ink-2); font-size:13px}
+  .diffhead .vs b{color:var(--ink)}
+  .buckets{display:grid; grid-template-columns:repeat(6,1fr); gap:8px}
+  @media (max-width:820px){.buckets{grid-template-columns:repeat(3,1fr)}}
+  .bk{border:1px solid var(--line); border-radius:9px; padding:10px 12px; background:var(--panel); position:relative; overflow:hidden}
+  .bk::before{content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--bkc)}
+  .bk .num{font-family:var(--mono); font-size:22px; font-weight:700; color:var(--ink); line-height:1.1}
+  .bk .lb{font-size:11px; color:var(--ink-2); font-weight:600; text-transform:capitalize}
+  .bk.uncertain{background:
+    repeating-linear-gradient(135deg,transparent,transparent 6px,color-mix(in srgb,var(--d-uncertain) 12%,transparent) 6px,color-mix(in srgb,var(--d-uncertain) 12%,transparent) 12px),var(--panel)}
+
+  .difftable{border:1px solid var(--line); border-radius:10px; overflow:hidden; background:var(--panel)}
+  .difftable .th,.difftable .tr{display:grid; grid-template-columns:118px 150px 150px 1fr; gap:12px; padding:9px 14px; align-items:center}
+  .difftable .th{background:var(--panel-2); border-bottom:1px solid var(--line); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--ink-3); font-weight:700}
+  .difftable .tr{border-bottom:1px solid var(--line); font-family:var(--mono); font-size:12px}
+  .difftable .tr:last-child{border-bottom:0}
+  .difftable .tr:hover{background:var(--panel-2)}
+  .bpill{font-family:var(--sans); font-size:10.5px; font-weight:700; padding:2px 9px; border-radius:20px; display:inline-flex; align-items:center; gap:6px; width:max-content}
+  .bpill::before{content:""; width:7px; height:7px; border-radius:50%; background:var(--bkc)}
+  .ea{color:var(--sx-addr)}
+  .nm-old{color:var(--asserted)}
+  .nm-new{color:var(--ink)}
+  .note{color:var(--heuristic); font-size:11px}
+  .carry{color:var(--ink-2)}
+  .applybtn{font-family:var(--sans); font-size:10.5px; font-weight:600; color:var(--asserted); background:var(--asserted-bg);
+            border:1px solid color-mix(in srgb,var(--asserted) 35%,transparent); border-radius:5px; padding:2px 9px}
+  .dash{color:var(--ink-3)}
+
+  /* ---------- provenance overlay (secondary state) ---------- */
+  .overlay{position:fixed; inset:0; background:color-mix(in srgb, var(--ground) 30%, rgba(0,0,0,.55)); display:none; align-items:center; justify-content:center; padding:22px; z-index:50}
+  .overlay.open{display:flex}
+  .pop{width:min(560px,100%); background:var(--panel); border:1px solid var(--line-strong); border-radius:14px; box-shadow:var(--shadow); overflow:hidden}
+  .pop .ph{display:flex; align-items:center; gap:10px; padding:14px 16px; border-bottom:1px solid var(--line); background:var(--panel-2)}
+  .pop .ph h3{margin:0; font-size:13px}
+  .pop .ph .sub{font-size:11px; color:var(--ink-3)}
+  .pop .pc{padding:16px}
+  .pop .x{margin-left:auto; background:transparent; border:1px solid var(--line); color:var(--ink-2); border-radius:6px; width:26px; height:26px; font-size:15px; line-height:1}
+  .hidden{display:none}
+
+  @media (max-width:1080px){
+    .work{grid-template-columns:210px minmax(0,1fr)}
+    .col.ctx{display:none}
+  }
+  @media (max-width:760px){
+    .work{grid-template-columns:1fr}
+    .col.nav{display:none}
+    .ins{grid-template-columns:112px 1fr; }
+    .ins .bytes{display:none}
+  }
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="app">
+  <!-- TOP BAR -->
+  <div class="topbar">
+    <div class="brand"><span class="spark" aria-hidden="true"></span>Aletheia</div>
+    <div class="bin mono">
+      <b>libz.1.3.dylib</b>
+      <span class="tag">x86-64</span><span class="tag">Mach-O</span>
+    </div>
+    <div class="stamp" title="Determinism stamp: same binary + engine version → byte-identical analysis">
+      <span class="ok" aria-hidden="true"></span>engine 0.6.0 · sha256:9f3e…a12c
+    </div>
+    <button class="tbtn" id="search">⌘K&nbsp;&nbsp;go to symbol / addr</button>
+    <button class="tbtn" id="theme" aria-label="Toggle color theme">◐ Theme</button>
+  </div>
+
+  <!-- VIEW SWITCH + STATIC-MOCKUP RIBBON -->
+  <div class="subbar">
+    <div class="seg" role="tablist" aria-label="Workspace view">
+      <button role="tab" aria-selected="true" data-view="work">Workspace</button>
+      <button role="tab" aria-selected="false" data-view="diff">Binary diff</button>
+    </div>
+    <button class="tbtn" id="openpop" style="margin-left:6px">Why do you believe this? ▸ heuristic example</button>
+    <div class="ribbon"><span class="dot" aria-hidden="true"></span>Static mockup — does not connect to the engine</div>
+  </div>
+
+  <!-- ============ WORKSPACE ============ -->
+  <div class="work" id="view-work">
+
+    <!-- LEFT: NAVIGATOR grouped by discovery source (funcs::Source) -->
+    <div class="col nav">
+      <div class="panel-h"><span class="eyebrow">Functions</span><span class="count">187 · by source</span></div>
+      <div class="scroll">
+        <div class="nav-group"><span class="eyebrow"><span class="tm proven"></span>Symbol · symtab</span><span class="n">142</span></div>
+        <div class="frow active"><span class="tm proven"></span><span class="nm">inflate</span><span class="fa">100000978</span></div>
+        <div class="frow"><span class="tm proven"></span><span class="nm">inflateReset</span><span class="fa">1000009d0</span></div>
+        <div class="frow"><span class="tm proven"></span><span class="nm">inflateInit2_</span><span class="fa">100000b10</span></div>
+        <div class="frow"><span class="tm proven"></span><span class="nm">adler32</span><span class="fa">100001240</span></div>
+        <div class="frow"><span class="tm proven"></span><span class="nm">crc32_z</span><span class="fa">1000013a0</span></div>
+
+        <div class="nav-group"><span class="eyebrow"><span class="tm proven"></span>Unwind · eh_frame</span><span class="n">38</span></div>
+        <div class="frow"><span class="tm proven"></span><span class="nm">fn_100000c40</span><span class="fa">100000c40</span></div>
+        <div class="frow"><span class="tm proven"></span><span class="nm">fn_100000e88</span><span class="fa">100000e88</span></div>
+
+        <div class="nav-group"><span class="eyebrow"><span class="pen">✎</span>Asserted · renamed</span><span class="n">4</span></div>
+        <div class="frow"><span class="tm asserted"></span><span class="nm">decode_header</span><span class="fa">1000011c0</span></div>
+
+        <div class="nav-group"><span class="eyebrow"><span class="tm heuristic"></span>Prologue · heuristic</span><span class="n">7</span></div>
+        <div class="frow"><span class="tm heuristic"></span><span class="nm">sub_1000012a0 <span class="qmark">?</span></span><span class="fa">1000012a0</span></div>
+        <div class="frow"><span class="tm heuristic"></span><span class="nm">sub_100001560 <span class="qmark">?</span></span><span class="fa">100001560</span></div>
+        <div class="frow"><span class="tm heuristic"></span><span class="nm">sub_1000018f4 <span class="qmark">?</span></span><span class="fa">1000018f4</span></div>
+      </div>
+    </div>
+
+    <!-- CENTER: symbolized listing (the hero) -->
+    <div class="col">
+      <div class="tabs" role="tablist" aria-label="Function view">
+        <button class="tab" role="tab" aria-selected="true">Listing</button>
+        <button class="tab" role="tab" aria-selected="false">IR / SSA · x86-64</button>
+        <button class="tab" role="tab" disabled title="Engine wave-3 — structuring + out-of-SSA + renderer are planned, not built">
+          Decompile<span class="mini">deferred</span>
+        </button>
+      </div>
+      <div class="scroll">
+        <div class="listing">
+
+          <!-- proven function: name from symtab, type asserted by analyst -->
+          <div class="fnhead">
+            <span class="sig"><span class="tm proven" title="boundary: Source::Symbol"></span>
+              <span class="ret">int</span> <span class="asm sym">inflate</span>(<span class="reg">z_streamp</span> strm, <span class="reg">int</span> flush)</span>
+            <button class="why" data-target="prov-inflate">why?</button>
+            <span class="pen" title="type asserted by analyst">✎</span>
+          </div>
+          <div class="xline">; xrefs to 100000978 &nbsp;←&nbsp; <a href="#">inflateBack</a>, <a href="#">main</a>, <a href="#">0x1000021a0</a> &nbsp;(+1)</div>
+
+          <div class="ins sel">
+            <span class="addr">0x100000978</span><span class="bytes">55</span>
+            <span class="asm"><span class="mn">push</span>   <span class="reg">rbp</span></span>
+          </div>
+          <div class="ins">
+            <span class="addr">0x100000979</span><span class="bytes">48 89 e5</span>
+            <span class="asm"><span class="mn">mov</span>    <span class="reg">rbp</span>, <span class="reg">rsp</span></span>
+          </div>
+          <div class="ins">
+            <span class="addr">0x10000097c</span><span class="bytes">41 57</span>
+            <span class="asm"><span class="mn">push</span>   <span class="reg">r15</span></span>
+          </div>
+          <div class="ins">
+            <span class="addr">0x10000097e</span><span class="bytes">48 8b 07</span>
+            <span class="asm"><span class="mn">mov</span>    <span class="reg">rax</span>, [<span class="reg">rdi</span>]</span>
+          </div>
+          <div class="ins">
+            <span class="addr">0x100000981</span><span class="bytes">83 f8 ff</span>
+            <span class="asm"><span class="mn">cmp</span>    <span class="reg">eax</span>, <span class="imm">-1</span></span>
+          </div>
+          <div class="ins">
+            <span class="addr">0x100000984</span><span class="bytes">0f 84 9c ..</span>
+            <span class="asm"><span class="mn">je</span>     <span class="op-trust"><span class="lbl">0x100000a26</span> <span class="cmt">; → <span class="sym">inflate.state_bad</span></span></span></span>
+          </div>
+          <div class="ins">
+            <span class="addr">0x10000098a</span><span class="bytes">e8 41 00 00 00</span>
+            <span class="asm"><span class="mn">call</span>   <span class="op-trust"><span class="lbl">0x1000009d0</span> <span class="cmt">; → <span class="sym">inflateReset</span></span> <span class="tm proven" title="target from Flow — exact"></span></span></span>
+          </div>
+          <div class="ins">
+            <span class="addr">0x10000098f</span><span class="bytes">48 8d 35 2a 3f ..</span>
+            <span class="asm"><span class="mn">lea</span>    <span class="reg">rsi</span>, [<span class="reg">rip</span> + <span class="imm">0x3f2a</span>] <span class="cmt">; → <span class="str">"incorrect header check"</span> (str_1000042d0)</span></span>
+          </div>
+
+          <!-- honest under-approximation: no text yet, still shows Flow -->
+          <div class="ins raw" title="asmtext returned None for this encoding; bytes shown verbatim, control flow still known from Flow">
+            <span class="addr">0x100000996</span><span class="bytes">c5 f8 77</span>
+            <span class="asm"><span class="mn">db c5 f8 77</span>   <span class="cmt">; no disasm text yet · flow: sequential</span></span>
+          </div>
+          <div class="ins">
+            <span class="addr">0x100000999</span><span class="bytes">44 89 f8</span>
+            <span class="asm"><span class="mn">mov</span>    <span class="reg">eax</span>, <span class="reg">r15d</span></span>
+          </div>
+          <div class="ins">
+            <span class="addr">0x10000099c</span><span class="bytes">5d</span>
+            <span class="asm"><span class="mn">pop</span>    <span class="reg">rbp</span></span>
+          </div>
+          <div class="ins">
+            <span class="addr">0x10000099d</span><span class="bytes">c3</span>
+            <span class="asm"><span class="mn">ret</span></span>
+          </div>
+
+          <!-- heuristic function -->
+          <div class="fnhead">
+            <span class="sig"><span class="tm heuristic" title="boundary: Source::Prologue — heuristic"></span>
+              <span class="asm lbl">sub_1000012a0</span> <span class="qmark">?</span></span>
+            <button class="why" data-target="__overlay">why?</button>
+          </div>
+          <div class="xline">; no symbol, no unwind entry covers this address — prologue-scan discovery</div>
+          <div class="ins">
+            <span class="addr">0x1000012a0</span><span class="bytes">55</span>
+            <span class="asm"><span class="mn">push</span>   <span class="reg">rbp</span></span>
+          </div>
+          <div class="ins">
+            <span class="addr">0x1000012a1</span><span class="bytes">48 89 e5</span>
+            <span class="asm"><span class="mn">mov</span>    <span class="reg">rbp</span>, <span class="reg">rsp</span> <span class="cmt">; ← matched prologue pattern</span></span>
+          </div>
+
+          <div class="footer-note">; listing complete — 187 functions, 0 caps hit. Rendered from cfg::Program + annotate::Db, deterministic.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: CONTEXT rail -->
+    <div class="col ctx">
+      <div class="scroll">
+        <!-- xrefs -->
+        <div class="card">
+          <div class="panel-h"><span class="eyebrow">Cross-references</span><span class="count">inflate</span></div>
+          <div class="body">
+            <div class="xref"><span class="k">to</span><a href="#">inflateBack <span class="ea">+0x40</span></a><span class="xtier exact">exact</span></div>
+            <div class="xref"><span class="k">to</span><a href="#">main <span class="ea">+0x1c4</span></a><span class="xtier exact">exact</span></div>
+            <div class="xref"><span class="k">to</span><span class="ea">0x1000021a0</span><span class="xtier heur">heuristic</span></div>
+            <div class="xref"><span class="k">from</span><a href="#">inflateReset <span class="ea">@ +0x12</span></a><span class="xtier exact">exact</span></div>
+          </div>
+        </div>
+
+        <!-- pinned provenance (proven) -->
+        <div class="card" id="prov-inflate">
+          <div class="panel-h"><span class="eyebrow">Provenance · pinned</span><span class="count">name = "inflate"</span></div>
+          <div class="body">
+            <div class="prov">
+              <div class="row"><span class="lab">Claim</span><span class="val"><b>name = "inflate"</b> @ <span class="hex">0x100000978</span></span></div>
+              <div class="row"><span class="lab">Source</span><span class="val"><b>funcs::Source::Symbol</b> — Mach-O symtab, Function-kind symbol in an executable region</span></div>
+              <div class="row"><span class="lab">Identity</span><span class="val">anchor shape=<span class="hex">0x9f3e…</span> (rebase-invariant) · bytes=<span class="hex">0x1a2c…</span> · insns=<b>41</b></span></div>
+              <div class="row"><span class="lab">Resolution</span><span class="val"><b>Exact(0x100000978)</b> — exact raw-byte match</span></div>
+              <div class="row"><span class="lab">Bytes</span><span class="val"><span class="hex">55 48 89 e5 41 57 48 8b 07 …</span> <a href="#">open hex →</a></span></div>
+              <div class="row verdict"><span class="lab">Verdict</span><span class="val"><span class="badge proven"><span class="tm proven"></span>Proven — metadata-backed</span></span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- annotations (log) -->
+        <div class="card">
+          <div class="panel-h"><span class="eyebrow">Annotations · this location</span></div>
+          <div class="body">
+            <div class="annot">
+              <div class="r"><span class="f">Name</span><span class="v">inflate <span class="cmt">(from symbol)</span></span></div>
+              <div class="r"><span class="f">Type</span><span class="v"><span class="pen">✎</span> int inflate(z_streamp, int)</span></div>
+              <div class="r"><span class="f">Comment</span><span class="v"><span class="pen">✎</span> "main decompress loop; flush semantics matter"</span></div>
+            </div>
+            <div class="logline"><span class="pen">✎</span> asserted → aletheia-annotations log · keyed by Anchor · <a href="#">undo (⌘Z)</a></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ DIFF VIEW ============ -->
+  <div class="diffwrap hidden" id="view-diff">
+    <div class="diffhead">
+      <span class="eyebrow">Binary diff</span>
+      <span class="vs mono"><b>libz.1.3.0.dylib</b> &nbsp;→&nbsp; <b>libz.1.3.1.dylib</b></span>
+    </div>
+    <div class="buckets">
+      <div class="bk" style="--bkc:var(--d-unchanged)"><div class="num">1204</div><div class="lb">Unchanged</div></div>
+      <div class="bk" style="--bkc:var(--d-moved)"><div class="num">318</div><div class="lb">Moved</div></div>
+      <div class="bk" style="--bkc:var(--d-modified)"><div class="num">47</div><div class="lb">Modified</div></div>
+      <div class="bk uncertain" style="--bkc:var(--d-uncertain)"><div class="num">6</div><div class="lb">Uncertain</div></div>
+      <div class="bk" style="--bkc:var(--d-added)"><div class="num">12</div><div class="lb">Added</div></div>
+      <div class="bk" style="--bkc:var(--d-removed)"><div class="num">3</div><div class="lb">Removed</div></div>
+    </div>
+
+    <div class="difftable">
+      <div class="th"><span>Bucket</span><span>Old @</span><span>New @</span><span>Detail</span></div>
+
+      <div class="tr">
+        <span class="bpill" style="--bkc:var(--d-moved)">moved</span>
+        <span class="ea">0x100000978</span><span class="ea">0x100000a10</span>
+        <span><span class="nm-new">inflate</span> <span class="dash">— identical bytes, linker relocated</span></span>
+      </div>
+
+      <div class="tr">
+        <span class="bpill" style="--bkc:var(--d-modified)">modified</span>
+        <span class="ea">0x1000009d0</span><span class="ea">0x100000a68</span>
+        <span><span class="nm-new">inflateReset</span> <span class="dash">— shape match, call displacement changed</span></span>
+      </div>
+
+      <div class="tr">
+        <span class="bpill" style="--bkc:var(--d-modified)">modified</span>
+        <span class="ea">0x1000011c0</span><span class="ea">0x100001258</span>
+        <span><span class="carry">carry <span class="nm-old">decode_header</span> → new (unnamed)</span> <button class="applybtn">✎ Apply name</button></span>
+      </div>
+
+      <div class="tr">
+        <span class="bpill" style="--bkc:var(--d-uncertain)">uncertain</span>
+        <span class="ea">0x1000012a0</span><span class="dash">— several</span>
+        <span><span class="note">ambiguous: 0x1000013b0, 0x100001440, 0x1000015f0 (2 more)</span> <span class="dash">— refused to guess</span></span>
+      </div>
+
+      <div class="tr">
+        <span class="bpill" style="--bkc:var(--d-uncertain)">uncertain</span>
+        <span class="ea">0x100001560</span><span class="ea">0x1000015f0</span>
+        <span><span class="note">address-only match</span> <span class="dash">— weakest evidence; verify</span></span>
+      </div>
+
+      <div class="tr">
+        <span class="bpill" style="--bkc:var(--d-added)">added</span>
+        <span class="dash">—</span><span class="ea">0x100001a20</span>
+        <span><span class="nm-new">inflateValidate</span> <span class="dash">— no old function matched</span></span>
+      </div>
+
+      <div class="tr">
+        <span class="bpill" style="--bkc:var(--d-removed)">removed</span>
+        <span class="ea">0x1000018f4</span><span class="dash">—</span>
+        <span><span class="nm-old">sub_1000018f4</span> <span class="dash">— nothing in the new build matched</span></span>
+      </div>
+    </div>
+    <div style="font-family:var(--mono); font-size:11px; color:var(--ink-3)">
+      ; no identity heuristics in the diff — every verdict is the anchor layer's Resolution, bucketed. Deterministic &amp; committable.
+    </div>
+  </div>
+
+  <!-- STATUS STRIP -->
+  <div class="status">
+    <span>Deterministic · same binary + engine → byte-identical view</span>
+    <span class="caps-ok">✓ no caps hit</span>
+    <div class="legend">
+      <span class="eyebrow">Trust</span>
+      <span class="li"><span class="tm proven"></span> proven</span>
+      <span class="li"><span class="tm heuristic"></span> heuristic <span class="qmark">?</span></span>
+      <span class="li"><span class="tm asserted"></span> <span class="pen">✎</span> asserted</span>
+    </div>
+  </div>
+</div>
+
+<!-- PROVENANCE OVERLAY — secondary state: the heuristic boundary, with its NEGATIVE row -->
+<div class="overlay" id="overlay">
+  <div class="pop" role="dialog" aria-modal="true" aria-label="Provenance">
+    <div class="ph">
+      <div>
+        <h3 class="mono">function start @ 0x1000012a0</h3>
+        <div class="sub">Why do you believe this?</div>
+      </div>
+      <button class="x" id="closepop" aria-label="Close">×</button>
+    </div>
+    <div class="pc">
+      <div class="prov">
+        <div class="row"><span class="lab">Claim</span><span class="val"><b>function start</b> @ <span class="hex">0x1000012a0</span></span></div>
+        <div class="row"><span class="lab">Source</span><span class="val"><b>funcs::Source::Prologue</b> — the only heuristic source; used last, only for addresses the first three missed</span></div>
+        <div class="row"><span class="lab">Rule</span><span class="val">matched a standard prologue <b>push rbp ; mov rbp, rsp</b></span></div>
+        <div class="row neg"><span class="lab">Negative</span><span class="val">no Symbol, no Unwind entry (.pdata / .eh_frame / FUNCTION_STARTS), and no Go pclntab entry covers this address</span></div>
+        <div class="row verdict heur"><span class="lab">Verdict</span><span class="val"><span class="badge heuristic"><span class="tm heuristic"></span>Heuristic — verify before relying on it</span></span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  var root=document.documentElement;
+  // theme toggle: cycle system → dark → light
+  document.getElementById('theme').addEventListener('click',function(){
+    var cur=root.getAttribute('data-theme');
+    var next=cur==='dark'?'light':(cur==='light'?null:'dark');
+    if(next)root.setAttribute('data-theme',next); else root.removeAttribute('data-theme');
+  });
+  // view switch
+  document.querySelectorAll('.seg [data-view]').forEach(function(b){
+    b.addEventListener('click',function(){
+      document.querySelectorAll('.seg [data-view]').forEach(function(x){x.setAttribute('aria-selected','false')});
+      b.setAttribute('aria-selected','true');
+      var v=b.getAttribute('data-view');
+      document.getElementById('view-work').classList.toggle('hidden',v!=='work');
+      document.getElementById('view-diff').classList.toggle('hidden',v!=='diff');
+    });
+  });
+  // center listing tabs (Listing / IR-SSA)
+  document.querySelectorAll('.tab').forEach(function(t){
+    t.addEventListener('click',function(){
+      if(t.hasAttribute('disabled'))return;
+      document.querySelectorAll('.tab').forEach(function(x){if(!x.hasAttribute('disabled'))x.setAttribute('aria-selected','false')});
+      t.setAttribute('aria-selected','true');
+    });
+  });
+  // provenance overlay
+  var ov=document.getElementById('overlay');
+  function openOv(){ov.classList.add('open')}
+  function closeOv(){ov.classList.remove('open')}
+  document.getElementById('openpop').addEventListener('click',openOv);
+  document.getElementById('closepop').addEventListener('click',closeOv);
+  ov.addEventListener('click',function(e){if(e.target===ov)closeOv()});
+  document.addEventListener('keydown',function(e){if(e.key==='Escape')closeOv()});
+  document.querySelectorAll('.why').forEach(function(w){
+    w.addEventListener('click',function(){
+      if(w.getAttribute('data-target')==='__overlay')openOv();
+    });
+  });
+</script>

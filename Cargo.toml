@@ -1,0 +1,12 @@
+[workspace]
+members = [".", "crates/aletheia-mcp"]
+resolver = "3"
+
+[package]
+name = "aletheia"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Clean-room binary-analysis toolkit: loaders, disassembly, and program analysis"
+
+[dependencies]

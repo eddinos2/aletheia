@@ -1,0 +1,14 @@
+[package]
+name = "aletheia-mcp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "MCP stdio server for the Aletheia analysis engine (Track 4)"
+publish = false
+
+[[bin]]
+name = "aletheia-mcp"
+path = "src/main.rs"
+
+[dependencies]
+aletheia = { path = "../.." }
