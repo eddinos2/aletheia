@@ -25,7 +25,7 @@ use aletheia::model::Arch;
 use aletheia::{
     aarch64, annotate, callfx, cfg, devirt, diff, flirt, funcs, gostrings, gotype, irlift, irout,
     irssa, irssaopt, irstruct, irstack, irtype, jumptable, listing, mempromote, objc, patch, pseudo,
-    rustmeta, sig, swift, types, vtable, x86,
+    rustmeta, sig, swift, typebounds, types, vtable, x86,
 };
 
 const USAGE: &str = "usage: redump <file> [--headers] [--sections] [--imports] [--symbols] [--exports] [--disasm[=N]] [--listing[=N]] [--db <path>] [--diff <new>]
@@ -110,9 +110,9 @@ const USAGE: &str = "usage: redump <file> [--headers] [--sections] [--imports] [
   --sigs[=N]    callee-side signature recovery (DESIGN sig), up to
                 N functions (default 4)
   --typefacts[=N]
-                SSA type-evidence facts (DESIGN irtype): load/store
-                widths, signedness hints, pointer address uses; refine
-                sig params when possible (default 4 functions)
+                SSA type-evidence facts + bounds lattice (DESIGN irtype
+                15–17): load/store widths, signedness, φ propagation,
+                explicit conflicts; refine sig params (default 4)
   --flirt[=path]
                 open FLIRT-style library ID (text corpus, not IDA .sig):
                 with no path, print the empty-corpus note; with a path,
@@ -772,6 +772,11 @@ fn print_typefacts(
             writeln!(out, "// typefacts check failed: {e}").map_err(io)?;
         }
         out.write_all(facts.render().as_bytes()).map_err(io)?;
+        let bounds = typebounds::analyze(&swept, &facts);
+        if let Err(e) = typebounds::check(&swept, &bounds) {
+            writeln!(out, "// typebounds check failed: {e}").map_err(io)?;
+        }
+        out.write_all(bounds.render().as_bytes()).map_err(io)?;
         let sig = sig::recover(&swept);
         let mut table = types::TypeTable::new();
         let map = irtype::attach_sig_with_evidence(&swept, &sig, &facts, &mut table);

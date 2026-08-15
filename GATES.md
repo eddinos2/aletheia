@@ -26,6 +26,13 @@ graph is cheap; typed prototypes via `irtype` + `types::ParamTypeMap::render_pro
 - [x] Patch `assemble_patch` beyond NOP (RET / B / BR / MOVZ)
 - [x] Open FLIRT sample under `testdata/flirt/sample.corpus`
 
+## Gate E3 — Type bounds lattice (DESIGN 16–17)
+
+- [x] Finite lattice with per-name `[lower .. upper]` (`src/typebounds.rs`)
+- [x] Directional φ / copy propagation; signed∩unsigned → explicit Conflict
+- [x] `check`: lower ≤ upper (or dual Conflict); `--typefacts` dumps bounds
+- [x] Presentation: Proven / Guess / `/* conflicting evidence */` tokens
+
 ## Gate I1 — iOS foundation
 
 - [x] Chained fixups header + imports parse on a real or synthetic image

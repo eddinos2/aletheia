@@ -1,11 +1,14 @@
-//! Type evidence facts from SSA (DESIGN slice 15 — evidence only).
+//! Type evidence facts from SSA (DESIGN irtype slices 15–17).
 //!
 //! One pass over SSA statements emits per-name usage facts that restate
 //! the IR: load/store address widths, signed vs unsigned operator uses,
 //! W1 (bool) contexts, and pointer hints when a LEA-shaped add/sub feeds
 //! an address use. Each fact cites its statement — the evidence trail is
-//! the proof. No solving, no bounds lattice (slice 16), no presentation
-//! policy beyond a labeled helper for later [`crate::pseudo`] wiring.
+//! the proof.
+//!
+//! Bounds (slice 16) and honest presentation (slice 17) live in
+//! [`crate::typebounds`]: finite lattice, directional φ/def-use
+//! propagation, explicit [`typebounds::Point::Conflict`].
 //!
 //! Total: never panics. Caps truncate rather than grow without bound.
 //! Deterministic via [`BTreeMap`] keyed by SSA name id.
@@ -265,13 +268,15 @@ pub fn refine_sig_params(
     }
 }
 
-/// Trust label for a display type: evidence-backed vs placeholder.
+/// Trust label for a display type: evidence-backed vs placeholder vs conflict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trust {
-    /// At least one fact justifies the displayed token.
+    /// At least one fact / bound justifies the displayed token.
     Proven,
     /// No facts — width-only / unknown placeholder.
     Unproven,
+    /// Signedness or ptr/int evidence disagree — honest conflict.
+    Conflict,
 }
 
 impl Trust {
@@ -279,6 +284,7 @@ impl Trust {
         match self {
             Trust::Proven => "proven",
             Trust::Unproven => "unproven",
+            Trust::Conflict => "conflict",
         }
     }
 }
@@ -300,36 +306,43 @@ impl DisplayType {
             None => format!("{} ({})", self.token, self.trust.token()),
         }
     }
+
+    /// Pseudocode-facing form (conflict comment when needed).
+    pub fn pseudo_token(&self) -> String {
+        match self.trust {
+            Trust::Conflict => format!("/* conflicting evidence */ {}", self.token),
+            Trust::Unproven => format!("/*?*/ {}", self.token),
+            Trust::Proven => self.token.clone(),
+        }
+    }
 }
 
-/// Presentation helper: map evidence on `name_id` to one labeled display
-/// type. Heuristic only where multiple facts disagree — conflict falls
-/// back to a width-only `intN` still tagged [`Trust::Proven`] when any
-/// fact exists (slice 17 will refine conflict rendering).
+/// Presentation helper: prefer [`crate::typebounds`] when evidence exists;
+/// otherwise width-only unproven. Conflict is never papered over as a
+/// confident `int`.
 pub fn present(f: &SsaFunction, facts: &TypeFacts, name_id: u16) -> DisplayType {
     let width = f
         .names
         .get(name_id as usize)
         .map(|n| n.width)
         .unwrap_or(Width::W64);
-    let Some(list) = facts.by_name.get(&name_id) else {
-        return DisplayType {
-            trust: Trust::Unproven,
-            token: format!("int{}", width.bits()),
-            name: Some(name_id),
-        };
-    };
-    if list.is_empty() {
+    if facts.by_name.get(&name_id).is_none_or(|l| l.is_empty()) {
         return DisplayType {
             trust: Trust::Unproven,
             token: format!("int{}", width.bits()),
             name: Some(name_id),
         };
     }
-    let token = summarize_facts(list, width);
+    let bounds = crate::typebounds::analyze(f, facts);
+    let d = crate::typebounds::present_bound(f, &bounds, name_id);
+    let trust = match d.trust {
+        crate::typebounds::BoundTrust::Proven => Trust::Proven,
+        crate::typebounds::BoundTrust::Guess => Trust::Unproven,
+        crate::typebounds::BoundTrust::Conflict => Trust::Conflict,
+    };
     DisplayType {
-        trust: Trust::Proven,
-        token,
+        trust,
+        token: d.token,
         name: Some(name_id),
     }
 }
@@ -802,6 +815,7 @@ fn collect_regs(e: &Expr, out: &mut Vec<Reg>) {
     }
 }
 
+#[allow(dead_code)] // retained for goldens / future presentation without bounds
 fn summarize_facts(list: &[Fact], width: Width) -> String {
     let mut has_ptr = false;
     let mut load_w: Option<Width> = None;

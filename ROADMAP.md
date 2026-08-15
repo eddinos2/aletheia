@@ -54,10 +54,10 @@ and Apple/iOS support over time.
 
 | Track | Landed | Next |
 |---|---|---|
-| **Engine** | irstack, sig (+confirm_returns), MEM promote, irtype→pseudo typed headers, FLIRT sample corpus | bounds lattice; FLIRT corpus growth |
-| **iOS / Apple** | chained walk, ObjC classes/methods + selrefs, Swift types + proto list | deeper Swift ABI / fieldmd |
-| **Patch / Diff** | PatchSet, patch-from-diff, resign recipe stub, A64 assemble (NOP/RET/B/BR/MOVZ) | codesign recipe depth |
-| **Agents / UI** | MCP protocol fill, `--json`, **GUI G1** (`aletheia-gui`: xref nav, CFG, deltas) | TUI / scripting ABI; finer delta ids |
+| **Engine** | irstack, sig, MEM promote, irtype evidence, **typebounds E3**, FLIRT sample | FLIRT corpus growth; scripting ABI |
+| **iOS / Apple** | chained walk, ObjC + selrefs, Swift types/proto/**fields** | deeper Swift ABI / protocol witnesses |
+| **Patch / Diff** | PatchSet, patch-from-diff, A64 assemble | codesign recipe depth |
+| **Agents / UI** | MCP, `--json`, GUI G1, bench smoke | finer delta ids; notarized DMG |
 
 Gates: see [GATES.md](GATES.md).
 
@@ -82,9 +82,9 @@ Loaders, decoders, CFG/funcs/xrefs, parallel engine, open annotations.
 - [x] Decompiler spine through `--decompile` (local_* + sig headers)
 - [x] Stack slots + MEM promote (`irstack` / `mempromote`)
 - [x] Callee/caller sig helpers + open FLIRT-style matcher (`flirt`)
-- [x] Type evidence (`irtype`)
+- [x] Type evidence (`irtype`) + bounds lattice (`typebounds`, Gate E3)
 - [x] PatchSet preview/apply + patch-from-diff
-- [x] ObjC / Swift early recoveries
+- [x] ObjC / Swift early recoveries (Swift field descriptors)
 
 ### Phase 6 — Poly-frontend — in progress
 

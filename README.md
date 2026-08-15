@@ -75,6 +75,7 @@ $ ./scripts/bench-smoke.sh --release # optional
 
 Timed open → functions → decompile → rename → xref → CFG → diff → patch
 checklist (GUI interactive + headless): [docs/GUI_BENCH_CHECKLIST.md](docs/GUI_BENCH_CHECKLIST.md).
+Fixture guidance: [docs/ADVERSARIAL_FIXTURES.md](docs/ADVERSARIAL_FIXTURES.md).
 Local baseline numbers: [docs/BENCH_BASELINE.md](docs/BENCH_BASELINE.md).
 
 ### macOS package (unsigned / ad-hoc)

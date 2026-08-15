@@ -10,7 +10,10 @@
 //!    pointers to type context descriptors, recovering the nominal name
 //!    string and kind (class / struct / enum) when the descriptor is
 //!    readable.
-//! 3. Optionally samples printable C-strings from `__swift5_reflstr`
+//! 3. Follows each type's `Fields` relative pointer to a public ABI
+//!    `FieldDescriptor`, recovering per-field names and mangled type
+//!    names from `FieldRecord`s (capped).
+//! 4. Optionally samples printable C-strings from `__swift5_reflstr`
 //!    and mangled-looking UTF-8 runs from `__swift5_typeref`.
 //!
 //! Full Swift demangling (`$s…` → readable signatures) is deliberately
@@ -43,6 +46,12 @@ pub const MAX_STRINGS: usize = 4096;
 /// Cap on a recovered C-string / mangled typeref fragment.
 pub const MAX_CSTR_LEN: usize = 1024;
 
+/// Cap on field records parsed from one type's `FieldDescriptor`.
+pub const MAX_FIELDS_PER_TYPE: usize = 4096;
+
+/// Cap on a recovered field name / field mangled-type string.
+pub const MAX_FIELD_NAME_LEN: usize = 256;
+
 /// Cap on `__swift5_*` sections inventoried (hostile section tables).
 pub const MAX_SECTIONS: usize = 256;
 
@@ -55,6 +64,16 @@ const MAX_PARENT_DEPTH: usize = 8;
 /// Minimum size of a type context descriptor before kind-specific fields:
 /// `Flags` + `Parent` + `Name` + `AccessFunction` + `Fields`.
 const TYPE_DESC_MIN: u64 = 20;
+
+/// Public ABI `FieldDescriptor` header size (before `FieldRecord`s):
+/// `MangledTypeName` + `Superclass` + `Kind` + `FieldRecordSize` + `NumFields`.
+const FIELD_DESC_HEADER: u64 = 16;
+
+/// Canonical `FieldRecord` size (`Flags` + `MangledTypeName` + `FieldName`).
+const FIELD_RECORD_MIN: u16 = 12;
+
+/// Absolute upper bound on a hostile `FieldRecordSize` stride.
+const FIELD_RECORD_SIZE_MAX: u16 = 64;
 
 /// `ContextDescriptorFlags` kind mask (low 5 bits).
 const KIND_MASK: u32 = 0x1F;
@@ -155,6 +174,19 @@ pub struct SwiftSection {
     pub offset: u32,
 }
 
+/// One recovered stored property / enum case from a `FieldRecord`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwiftField {
+    /// Field / case name from the record's `FieldName` relative pointer.
+    pub name: String,
+    /// Mangled type name when the record's `MangledTypeName` is a
+    /// readable printable C-string (symbolic-ref payloads are skipped).
+    pub mangled_type: Option<String>,
+    /// Byte offset within an instance when known. Field records alone do
+    /// not carry offsets; reserved for future metadata-vector recovery.
+    pub offset: Option<u32>,
+}
+
 /// One recovered nominal type from `__swift5_types`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwiftType {
@@ -167,6 +199,9 @@ pub struct SwiftType {
     pub kind: SwiftTypeKind,
     /// Raw `ContextDescriptorFlags` word.
     pub flags: u32,
+    /// Fields from the type's `FieldDescriptor`, when the `Fields`
+    /// relative pointer is readable (capped at [`MAX_FIELDS_PER_TYPE`]).
+    pub fields: Vec<SwiftField>,
 }
 
 /// Recovered Swift metadata for one thin Mach-O image.
@@ -313,6 +348,16 @@ pub fn render(image: &SwiftImage, max_types: usize) -> String {
                 "    {} {}  // va {:#x}  flags {:#x}",
                 ty.kind, qual, ty.va, ty.flags
             );
+            for field in &ty.fields {
+                match &field.mangled_type {
+                    Some(ty_name) if !ty_name.is_empty() => {
+                        let _ = writeln!(out, "      {} : {ty_name}", field.name);
+                    }
+                    _ => {
+                        let _ = writeln!(out, "      {}", field.name);
+                    }
+                }
+            }
         }
         if shown < image.types.len() {
             let _ = writeln!(
@@ -465,6 +510,11 @@ fn read_u32(mach: &MachFile, data: &[u8], va: u64) -> Option<u32> {
     Some(u32::from_le_bytes(b.try_into().ok()?))
 }
 
+fn read_u16(mach: &MachFile, data: &[u8], va: u64) -> Option<u16> {
+    let b = bytes_at(mach, data, va, 2)?;
+    Some(u16::from_le_bytes(b.try_into().ok()?))
+}
+
 fn read_i32(mach: &MachFile, data: &[u8], va: u64) -> Option<i32> {
     read_u32(mach, data, va).map(|u| u as i32)
 }
@@ -481,12 +531,16 @@ fn relative_va(field_va: u64, rel: i32) -> Option<u64> {
 }
 
 fn read_cstr(mach: &MachFile, data: &[u8], va: u64) -> Option<String> {
+    read_cstr_capped(mach, data, va, MAX_CSTR_LEN)
+}
+
+fn read_cstr_capped(mach: &MachFile, data: &[u8], va: u64, max_len: usize) -> Option<String> {
     if va == 0 {
         return None;
     }
     let off = mach.vaddr_to_offset(va).ok()?;
     let rest = data.get(off..)?;
-    let lim = rest.len().min(MAX_CSTR_LEN);
+    let lim = rest.len().min(max_len);
     let window = &rest[..lim];
     let len = window.iter().position(|&b| b == 0).unwrap_or(lim);
     if len == 0 {
@@ -608,13 +662,122 @@ fn parse_type_descriptor(mach: &MachFile, data: &[u8], desc_va: u64) -> Option<S
         return None;
     }
     let module = resolve_module_name(mach, data, desc_va);
+    // Fields relative pointer at +16 (after AccessFunction at +12).
+    let fields = match read_i32(mach, data, desc_va + 16) {
+        Some(fields_rel) => match relative_va(desc_va + 16, fields_rel) {
+            Some(fields_va) => parse_field_descriptor(mach, data, fields_va),
+            None => Vec::new(),
+        },
+        None => Vec::new(),
+    };
     Some(SwiftType {
         va: desc_va,
         name,
         module,
         kind,
         flags,
+        fields,
     })
+}
+
+/// Parse a public ABI `FieldDescriptor` at `desc_va`.
+///
+/// Soft-fails to an empty list on any corruption / bounds issue — field
+/// recovery must never abort type recovery.
+fn parse_field_descriptor(mach: &MachFile, data: &[u8], desc_va: u64) -> Vec<SwiftField> {
+    let Some(_) = bytes_at(mach, data, desc_va, FIELD_DESC_HEADER as usize) else {
+        return Vec::new();
+    };
+    // Header layout (Apple Swift ABI / RemoteInspection Records.h):
+    //   +0  RelativeDirectPointer MangledTypeName
+    //   +4  RelativeDirectPointer Superclass
+    //   +8  uint16 Kind
+    //   +10 uint16 FieldRecordSize
+    //   +12 uint32 NumFields
+    //   +16 FieldRecord[NumFields]…
+    let Some(record_size) = read_u16(mach, data, desc_va + 10) else {
+        return Vec::new();
+    };
+    if !(FIELD_RECORD_MIN..=FIELD_RECORD_SIZE_MAX).contains(&record_size) {
+        return Vec::new();
+    }
+    let Some(num_fields) = read_u32(mach, data, desc_va + 12) else {
+        return Vec::new();
+    };
+    let num_fields = num_fields as usize;
+    if num_fields == 0 {
+        return Vec::new();
+    }
+    let take = num_fields.min(MAX_FIELDS_PER_TYPE);
+    let stride = record_size as u64;
+    let records_base = desc_va.saturating_add(FIELD_DESC_HEADER);
+
+    // Ensure the claimed record array is file-backed before walking.
+    let total_bytes = (take as u64).saturating_mul(stride);
+    if total_bytes == 0
+        || bytes_at(mach, data, records_base, total_bytes as usize).is_none()
+    {
+        return Vec::new();
+    }
+
+    let mut fields = Vec::new();
+    for i in 0..take {
+        let Some(rec_va) = records_base.checked_add((i as u64).saturating_mul(stride)) else {
+            break;
+        };
+        if let Some(field) = parse_field_record(mach, data, rec_va) {
+            fields.push(field);
+        }
+    }
+    fields
+}
+
+fn parse_field_record(mach: &MachFile, data: &[u8], rec_va: u64) -> Option<SwiftField> {
+    // FieldRecord: Flags(+0) + MangledTypeName(+4) + FieldName(+8).
+    let _ = bytes_at(mach, data, rec_va, FIELD_RECORD_MIN as usize)?;
+    let name_rel = read_i32(mach, data, rec_va + 8)?;
+    let name_va = relative_va(rec_va + 8, name_rel)?;
+    let name = read_cstr_capped(mach, data, name_va, MAX_FIELD_NAME_LEN)?;
+    if !looks_like_field_name(&name) {
+        return None;
+    }
+    let mangled_type = read_i32(mach, data, rec_va + 4)
+        .and_then(|rel| relative_va(rec_va + 4, rel))
+        .and_then(|va| read_cstr_capped(mach, data, va, MAX_FIELD_NAME_LEN))
+        .filter(|s| looks_like_mangled_or_ident(s));
+    Some(SwiftField {
+        name,
+        mangled_type,
+        offset: None,
+    })
+}
+
+fn looks_like_field_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() > MAX_FIELD_NAME_LEN {
+        return false;
+    }
+    // Property / case names are identifiers; reject mangled `$s…` payloads.
+    if b[0] == b'$' {
+        return false;
+    }
+    b.iter().all(|&c| {
+        c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+    }) && b.iter().any(|&c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+fn looks_like_mangled_or_ident(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() > MAX_FIELD_NAME_LEN {
+        return false;
+    }
+    // Accept Swift mangling prefixes and short type identifiers.
+    if s.starts_with("$s") || s.starts_with("$S") || s.starts_with("_T") {
+        return b.iter().all(|&c| (0x20..=0x7E).contains(&c));
+    }
+    b.iter()
+        .all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$')
+        && b.iter().any(|&c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
 fn looks_like_swift_ident(s: &str) -> bool {
@@ -754,18 +917,28 @@ mod tests {
     // as __TEXT file-backed from offset 0).
     const NAME_OFF: usize = 0x280; // "Demo\0"
     const MODNAME_OFF: usize = 0x288; // "App\0"
-    const REFL_OFF: usize = 0x290; // "count\0"
-    const TYPREF_OFF: usize = 0x2A0; // "$s3App4DemoV\0"
+    const FNAME0_OFF: usize = 0x290; // "count\0"
+    const FNAME1_OFF: usize = 0x298; // "label\0"
+    const FTYPE0_OFF: usize = 0x2A0; // "$sSi\0"
+    const FTYPE1_OFF: usize = 0x2A8; // "$sSS\0"
+    const TYPREF_OFF: usize = 0x2B0; // "$s3App4DemoV\0"
     const MODULE_OFF: usize = 0x2C0; // module descriptor
     const STRUCT_OFF: usize = 0x2D0; // struct descriptor
-    const TYPES_OFF: usize = 0x300; // __swift5_types (one rel32)
-    const REFLSECT_OFF: usize = 0x310;
-    const TYPREFSECT_OFF: usize = 0x320;
+    const FIELDMD_OFF: usize = 0x300; // FieldDescriptor + 2 FieldRecords
+    const TYPES_OFF: usize = 0x340; // __swift5_types (one rel32)
+    const REFLSECT_OFF: usize = 0x350;
+    const TYPREFSECT_OFF: usize = 0x360;
+
+    /// Public ABI `FieldDescriptorKind::Struct`.
+    const FIELD_KIND_STRUCT: u16 = 0;
 
     fn put(img: &mut [u8], off: usize, bytes: &[u8]) {
         img[off..off + bytes.len()].copy_from_slice(bytes);
     }
     fn put32(img: &mut [u8], off: usize, v: u32) {
+        put(img, off, &v.to_le_bytes());
+    }
+    fn put16(img: &mut [u8], off: usize, v: u16) {
         put(img, off, &v.to_le_bytes());
     }
     fn put64(img: &mut [u8], off: usize, v: u64) {
@@ -797,7 +970,8 @@ mod tests {
         i32::try_from(delta).expect("synthetic rel in range")
     }
 
-    /// Thin arm64 Mach-O with one Swift struct `App.Demo` and sample
+    /// Thin arm64 Mach-O with one Swift struct `App.Demo` having two
+    /// fields (`count: Int`, `label: String`) plus sample
     /// `__swift5_reflstr` / `__swift5_typeref` strings.
     fn synthetic_swift_macho() -> Vec<u8> {
         let mut img = vec![0u8; IMG_SIZE];
@@ -842,7 +1016,7 @@ mod tests {
             b"__const",
             b"__TEXT",
             TEXT_VM + MODULE_OFF as u64,
-            0x40,
+            0x80,
             MODULE_OFF as u32,
         );
         write_section(
@@ -860,7 +1034,7 @@ mod tests {
             b"__swift5_reflstr",
             b"__TEXT",
             TEXT_VM + REFLSECT_OFF as u64,
-            8,
+            0x10,
             REFLSECT_OFF as u32,
         );
         write_section(
@@ -869,14 +1043,17 @@ mod tests {
             b"__swift5_typeref",
             b"__TEXT",
             TEXT_VM + TYPREFSECT_OFF as u64,
-            0x10,
+            0x20,
             TYPREFSECT_OFF as u32,
         );
 
         // Strings.
         put(&mut img, NAME_OFF, b"Demo\0");
         put(&mut img, MODNAME_OFF, b"App\0");
-        put(&mut img, REFL_OFF, b"count\0");
+        put(&mut img, FNAME0_OFF, b"count\0");
+        put(&mut img, FNAME1_OFF, b"label\0");
+        put(&mut img, FTYPE0_OFF, b"$sSi\0");
+        put(&mut img, FTYPE1_OFF, b"$sSS\0");
         put(&mut img, TYPREF_OFF, b"$s3App4DemoV\0");
 
         // Module descriptor at MODULE_OFF.
@@ -891,6 +1068,7 @@ mod tests {
 
         // Struct descriptor at STRUCT_OFF.
         let struct_va = TEXT_VM + STRUCT_OFF as u64;
+        let fieldmd_va = TEXT_VM + FIELDMD_OFF as u64;
         put32(&mut img, STRUCT_OFF, KIND_STRUCT); // Flags
         put_i32(
             &mut img,
@@ -903,17 +1081,63 @@ mod tests {
             rel32(struct_va + 8, TEXT_VM + NAME_OFF as u64),
         ); // Name
         put_i32(&mut img, STRUCT_OFF + 12, 0); // AccessFunction
-        put_i32(&mut img, STRUCT_OFF + 16, 0); // Fields
-        put32(&mut img, STRUCT_OFF + 20, 0); // NumFields
+        put_i32(
+            &mut img,
+            STRUCT_OFF + 16,
+            rel32(struct_va + 16, fieldmd_va),
+        ); // Fields → FieldDescriptor
+        put32(&mut img, STRUCT_OFF + 20, 2); // NumFields
         put32(&mut img, STRUCT_OFF + 24, 0); // FieldOffsetVectorOffset
+
+        // FieldDescriptor + two FieldRecords at FIELDMD_OFF.
+        // Header: MangledTypeName, Superclass, Kind, FieldRecordSize, NumFields.
+        put_i32(
+            &mut img,
+            FIELDMD_OFF,
+            rel32(fieldmd_va, TEXT_VM + TYPREF_OFF as u64),
+        ); // MangledTypeName → $s3App4DemoV
+        put_i32(&mut img, FIELDMD_OFF + 4, 0); // Superclass null
+        put16(&mut img, FIELDMD_OFF + 8, FIELD_KIND_STRUCT);
+        put16(&mut img, FIELDMD_OFF + 10, FIELD_RECORD_MIN);
+        put32(&mut img, FIELDMD_OFF + 12, 2); // NumFields
+
+        // FieldRecord 0: count / $sSi
+        let rec0 = FIELDMD_OFF + FIELD_DESC_HEADER as usize;
+        let rec0_va = fieldmd_va + FIELD_DESC_HEADER;
+        put32(&mut img, rec0, 0); // Flags
+        put_i32(
+            &mut img,
+            rec0 + 4,
+            rel32(rec0_va + 4, TEXT_VM + FTYPE0_OFF as u64),
+        );
+        put_i32(
+            &mut img,
+            rec0 + 8,
+            rel32(rec0_va + 8, TEXT_VM + FNAME0_OFF as u64),
+        );
+
+        // FieldRecord 1: label / $sSS
+        let rec1 = rec0 + FIELD_RECORD_MIN as usize;
+        let rec1_va = rec0_va + FIELD_RECORD_MIN as u64;
+        put32(&mut img, rec1, 0);
+        put_i32(
+            &mut img,
+            rec1 + 4,
+            rel32(rec1_va + 4, TEXT_VM + FTYPE1_OFF as u64),
+        );
+        put_i32(
+            &mut img,
+            rec1 + 8,
+            rel32(rec1_va + 8, TEXT_VM + FNAME1_OFF as u64),
+        );
 
         // __swift5_types: one relative pointer to the struct descriptor.
         let types_va = TEXT_VM + TYPES_OFF as u64;
         put_i32(&mut img, TYPES_OFF, rel32(types_va, struct_va));
 
-        // Reflection / typeref section payloads (copy of the string bytes).
-        put(&mut img, REFLSECT_OFF, b"count\0\0\0");
-        put(&mut img, TYPREFSECT_OFF, b"$s3App4DemoV\0\0\0");
+        // Reflection / typeref section payloads.
+        put(&mut img, REFLSECT_OFF, b"count\0label\0\0\0");
+        put(&mut img, TYPREFSECT_OFF, b"$s3App4DemoV\0$sSi\0$sSS\0");
 
         img
     }
@@ -980,6 +1204,22 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_recovers_struct_fields() {
+        let img = synthetic_swift_macho();
+        let mach = MachFile::parse(&img).unwrap();
+        let sw = recover(&mach, &img).expect("swift");
+        assert_eq!(sw.types.len(), 1);
+        let fields = &sw.types[0].fields;
+        assert_eq!(fields.len(), 2, "{fields:?}");
+        assert_eq!(fields[0].name, "count");
+        assert_eq!(fields[0].mangled_type.as_deref(), Some("$sSi"));
+        assert_eq!(fields[0].offset, None);
+        assert_eq!(fields[1].name, "label");
+        assert_eq!(fields[1].mangled_type.as_deref(), Some("$sSS"));
+        assert_eq!(fields[1].offset, None);
+    }
+
+    #[test]
     fn render_lists_types_and_inventory() {
         let img = synthetic_swift_macho();
         let mach = MachFile::parse(&img).unwrap();
@@ -987,6 +1227,8 @@ mod tests {
         let text = render(&sw, 16);
         assert!(text.contains("__swift5_types"), "{text}");
         assert!(text.contains("struct App.Demo"), "{text}");
+        assert!(text.contains("count : $sSi"), "{text}");
+        assert!(text.contains("label : $sSS"), "{text}");
         assert!(text.contains("refl \"count\""), "{text}");
         assert!(text.contains("typeref \"$s3App4DemoV\""), "{text}");
     }
@@ -1013,5 +1255,16 @@ mod tests {
             matches!(err, SwiftError::SectionTruncated { .. }),
             "{err}"
         );
+    }
+
+    #[test]
+    fn null_fields_pointer_yields_empty_fields() {
+        let mut img = synthetic_swift_macho();
+        // Zero the Fields relative pointer on the struct descriptor.
+        put_i32(&mut img, STRUCT_OFF + 16, 0);
+        let mach = MachFile::parse(&img).unwrap();
+        let sw = recover(&mach, &img).unwrap();
+        assert_eq!(sw.types.len(), 1);
+        assert!(sw.types[0].fields.is_empty());
     }
 }

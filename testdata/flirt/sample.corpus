@@ -2,19 +2,35 @@
 # Lines: CRC-32 (IEEE, poly 0xEDB88320) of first 32 bytes TAB name
 #    or: whitespace-separated hex bytes (?? = wildcard) TAB name
 #
-# Patterns below are illustrative x86-64 / AArch64 prologues for matcher tests.
+# Patterns below are illustrative x86-64 / AArch64 prologues for matcher tests
+# and a starter open corpus researchers can extend.
 
 # Classic x86-64 frame: push rbp; mov rbp, rsp
 55 48 89 e5	x64_frame_setup
 
+# x86-64: push rbp; mov rbp, rsp; push rbx
+55 48 89 e5 53	x64_frame_setup_rbx
+
+# x86-64 leaf: endbr64 (CET) then ret-ish region — endbr only
+f3 0f 1e fa	x64_endbr64
+
 # AArch64: stp x29, x30, [sp, #-16]!; mov x29, sp  (common frame)
 fd 7b bf a9 fd 03 00 91	a64_frame_setup
+
+# AArch64: stp x29, x30, [sp, #-32]!
+fd 7b be a9	a64_frame_stp32
 
 # AArch64: ret
 c0 03 5f d6	a64_ret
 
+# AArch64: retab (PAC) — treated as control transfer in engine; pattern for ID
+ff 0f 5f d6	a64_retab
+
 # x86-64: ret
 c3	x64_ret
+
+# x86-64: rep ret (AMD branch predictor hint)
+f3 c3	x64_rep_ret
 
 # Placeholder CRC (will not match unless a function prefix hashes equal)
 00000000	unused_crc_placeholder
