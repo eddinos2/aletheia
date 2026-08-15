@@ -7,3 +7,8 @@
 # Slice plans are local engineering notes — not part of the public tree.
 PLAN_*.md
 /dist
+
+# Local analysis dumps
+dump_*.txt
+*.pdb
+.redump/
