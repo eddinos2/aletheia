@@ -12,7 +12,19 @@ noted.
 - [x] `cargo test evalfx` green; `irstack` unit tests green
 
 **Done:** `irstack` + `mempromote` namers and `sig::render_header` wired
-into `redump --decompile` and `aletheia-mcp` decompile.
+into `redump --decompile` and `aletheia-mcp` decompile. Caller-side
+`sig::try_confirm_returns` upgrades AbiAssumed returns when the call
+graph is cheap; typed prototypes via `irtype` + `types::ParamTypeMap::render_proto`.
+
+## Gate E2 — Engine fidelity (post-G1)
+
+- [x] `confirm_returns` on decompile / MCP / `--sigs` when CG edges ≤ cap
+- [x] Typed pseudo headers from irtype evidence (safe presentation)
+- [x] ObjC `__objc_selrefs` listing
+- [x] Swift `__swift5_proto` conformance VA list
+- [x] A64 `PRFM` (unsigned offset) + scalar `CRC32*`
+- [x] Patch `assemble_patch` beyond NOP (RET / B / BR / MOVZ)
+- [x] Open FLIRT sample under `testdata/flirt/sample.corpus`
 
 ## Gate I1 — iOS foundation
 

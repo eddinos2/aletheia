@@ -2457,9 +2457,30 @@ fn lift_with(insn: &aarch64::Instruction, va: u64, temp: &mut u16) -> Vec<Stmt> 
         Opcode::Wfi => intr("wfi", vec![], vec![]),
         Opcode::Sev => intr("sev", vec![], vec![]),
         Opcode::Sevl => intr("sevl", vec![], vec![]),
-        // No architectural effect: NOP, and unallocated hints execute as
-        // NOP by definition.
-        Opcode::Nop | Opcode::Hint { .. } => Vec::new(),
+        // No architectural effect: NOP, unallocated hints (execute as NOP),
+        // and PRFM prefetch hints.
+        Opcode::Nop | Opcode::Hint { .. } | Opcode::Prfm { .. } => Vec::new(),
+        Opcode::Crc32 {
+            c,
+            sz,
+            sf,
+            rd: rdn,
+            rn,
+            rm,
+        } => {
+            let name = if c { "a64.crc32c" } else { "a64.crc32" };
+            let src_w = if sf { Width::W64 } else { Width::W32 };
+            let _ = sz;
+            if rdn == 31 {
+                Vec::new()
+            } else {
+                intr(
+                    name,
+                    vec![cell(rdn)],
+                    vec![read_zr(rn, Width::W32), read_zr(rm, src_w)],
+                )
+            }
+        }
         Opcode::Unknown(raw) => unknown_intrinsic(raw),
     };
     *temp = ctx.temp;

@@ -1461,7 +1461,9 @@ fn a64_defs(ins: &aarch64::Instruction) -> u32 {
         | O::Wfi
         | O::Sev
         | O::Sevl
-        | O::Hint { .. } => 0,
+        | O::Hint { .. }
+        | O::Prfm { .. } => 0,
+        O::Crc32 { rd, .. } => bit(rd),
         // Scalar FP arithmetic, compares, selects, and the whole-register
         // SIMD element writes touch no X register; the FP→general
         // conversions and element extractions define exactly Rd/Rt.

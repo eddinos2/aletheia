@@ -38,6 +38,9 @@ pub const MAX_METHODS_PER_CLASS: usize = 4096;
 /// Cap on a recovered C-string name / selector / type encoding.
 pub const MAX_CSTR_LEN: usize = 1024;
 
+/// Cap on selector references recovered from `__objc_selrefs`.
+pub const MAX_SELREFS: usize = 65_536;
+
 /// Low bits of `class_data_bits_t` that encode flags, not the pointer
 /// (`FAST_DATA_MASK` clears these — public objc4 layout).
 const CLASS_DATA_FLAG_MASK: u64 = 0x7;
@@ -128,6 +131,15 @@ pub struct ObjcMethod {
     pub is_class: bool,
 }
 
+/// One `__objc_selrefs` slot: the pointer's own VA and the selector string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjcSelRef {
+    /// Virtual address of the selref pointer itself (xref target site).
+    pub va: u64,
+    /// Selector C-string when the pointee resolved.
+    pub name: String,
+}
+
 /// One recovered ObjC class from `__objc_classlist`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjcClass {
@@ -149,13 +161,19 @@ pub struct ObjcImage {
     pub classes: Vec<ObjcClass>,
     /// True when `__objc_classlist` held more pointers than the class cap.
     pub classes_capped: bool,
-    /// File offset / VA of the class list section that was walked, when any.
+    /// File VA of the class list section that was walked, when any.
     pub classlist_va: Option<u64>,
+    /// Selector references from `__objc_selrefs` (capped).
+    pub selrefs: Vec<ObjcSelRef>,
+    /// True when selref recovery hit [`MAX_SELREFS`].
+    pub selrefs_capped: bool,
+    /// File VA of `__objc_selrefs` when present.
+    pub selrefs_va: Option<u64>,
 }
 
 impl ObjcImage {
     pub fn is_empty(&self) -> bool {
-        self.classes.is_empty()
+        self.classes.is_empty() && self.selrefs.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -171,8 +189,15 @@ pub fn recover(mach: &MachFile, data: &[u8]) -> ObjcResult<ObjcImage> {
 /// Recover ObjC classes/methods, keeping at most `max_classes` classes.
 pub fn recover_capped(mach: &MachFile, data: &[u8], max_classes: usize) -> ObjcResult<ObjcImage> {
     let max_classes = max_classes.min(MAX_CLASSES);
+    let (selrefs, selrefs_capped, selrefs_va) = recover_selrefs(mach, data)?;
+
     let Some(sect) = find_section(mach, "__objc_classlist") else {
-        return Ok(ObjcImage::default());
+        return Ok(ObjcImage {
+            selrefs,
+            selrefs_capped,
+            selrefs_va,
+            ..ObjcImage::default()
+        });
     };
     let classlist = section_bytes(data, sect)?;
     let classlist_va = Some(sect.addr);
@@ -215,13 +240,59 @@ pub fn recover_capped(mach: &MachFile, data: &[u8], max_classes: usize) -> ObjcR
         classes,
         classes_capped,
         classlist_va,
+        selrefs,
+        selrefs_capped,
+        selrefs_va,
     })
+}
+
+/// Walk `__objc_selrefs`: each 8-byte slot is a pointer to a selector
+/// C-string in `__objc_methname` (or equivalent). Total; caps truncate.
+fn recover_selrefs(
+    mach: &MachFile,
+    data: &[u8],
+) -> ObjcResult<(Vec<ObjcSelRef>, bool, Option<u64>)> {
+    let Some(sect) = find_section(mach, "__objc_selrefs") else {
+        return Ok((Vec::new(), false, None));
+    };
+    let bytes = section_bytes(data, sect)?;
+    let n_ptrs = bytes.len() / 8;
+    if n_ptrs > MAX_SELREFS {
+        return Err(ObjcError::CapExceeded {
+            what: "selrefs pointers",
+            value: n_ptrs,
+            cap: MAX_SELREFS,
+        });
+    }
+    let mut out = Vec::new();
+    let mut capped = false;
+    for (i, chunk) in bytes.chunks_exact(8).enumerate() {
+        if out.len() >= MAX_SELREFS {
+            capped = true;
+            break;
+        }
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        let sel_va = u64::from_le_bytes(word);
+        if sel_va == 0 {
+            continue;
+        }
+        let Some(name) = read_cstr(mach, data, sel_va) else {
+            continue;
+        };
+        let slot_va = sect.addr.saturating_add((i as u64).saturating_mul(8));
+        out.push(ObjcSelRef { va: slot_va, name });
+    }
+    if !capped && n_ptrs > out.len() && out.len() >= MAX_SELREFS {
+        capped = true;
+    }
+    Ok((out, capped, Some(sect.addr)))
 }
 
 /// Render a human-readable listing for `redump --objc`.
 pub fn render(image: &ObjcImage, max_classes: usize) -> String {
     let mut out = String::new();
-    if image.classes.is_empty() {
+    if image.classes.is_empty() && image.selrefs.is_empty() {
         out.push_str("  (no ObjC classes recovered");
         if image.classlist_va.is_none() {
             out.push_str("; no __objc_classlist section");
@@ -230,43 +301,69 @@ pub fn render(image: &ObjcImage, max_classes: usize) -> String {
         return out;
     }
 
-    let shown = image.classes.len().min(max_classes);
-    let _ = writeln!(
-        out,
-        "  {} class(es) recovered{}",
-        image.classes.len(),
-        if image.classes_capped {
-            " (class list capped)"
-        } else {
-            ""
-        }
-    );
-    for cls in image.classes.iter().take(shown) {
-        let _ = writeln!(out, "  @interface {}  // va {:#x}", cls.name, cls.va);
-        for m in &cls.methods {
-            let mark = if m.is_class { '+' } else { '-' };
-            let types = if m.types.is_empty() {
-                String::new()
-            } else {
-                format!("  // {}", m.types)
-            };
-            let imp = match m.imp {
-                Some(va) => format!("  imp {:#x}", va),
-                None => String::new(),
-            };
-            let _ = writeln!(out, "    {mark}[{} {}]{imp}{types}", cls.name, m.name);
-        }
-        if cls.methods_capped {
-            let _ = writeln!(out, "    // methods capped at {MAX_METHODS_PER_CLASS}");
-        }
-        let _ = writeln!(out, "  @end");
-    }
-    if shown < image.classes.len() {
+    if !image.classes.is_empty() {
+        let shown = image.classes.len().min(max_classes);
         let _ = writeln!(
             out,
-            "  … {} more class(es) omitted (cap {max_classes})",
-            image.classes.len() - shown
+            "  {} class(es) recovered{}",
+            image.classes.len(),
+            if image.classes_capped {
+                " (class list capped)"
+            } else {
+                ""
+            }
         );
+        for cls in image.classes.iter().take(shown) {
+            let _ = writeln!(out, "  @interface {}  // va {:#x}", cls.name, cls.va);
+            for m in &cls.methods {
+                let mark = if m.is_class { '+' } else { '-' };
+                let types = if m.types.is_empty() {
+                    String::new()
+                } else {
+                    format!("  // {}", m.types)
+                };
+                let imp = match m.imp {
+                    Some(va) => format!("  imp {:#x}", va),
+                    None => String::new(),
+                };
+                let _ = writeln!(out, "    {mark}[{} {}]{imp}{types}", cls.name, m.name);
+            }
+            if cls.methods_capped {
+                let _ = writeln!(out, "    // methods capped at {MAX_METHODS_PER_CLASS}");
+            }
+            let _ = writeln!(out, "  @end");
+        }
+        if shown < image.classes.len() {
+            let _ = writeln!(
+                out,
+                "  … {} more class(es) omitted (cap {max_classes})",
+                image.classes.len() - shown
+            );
+        }
+    }
+
+    if !image.selrefs.is_empty() || image.selrefs_va.is_some() {
+        let _ = writeln!(
+            out,
+            "  {} selref(s){}",
+            image.selrefs.len(),
+            if image.selrefs_capped {
+                " (selrefs capped)"
+            } else {
+                ""
+            }
+        );
+        let sel_cap = max_classes.saturating_mul(4).clamp(16, 256);
+        for s in image.selrefs.iter().take(sel_cap) {
+            let _ = writeln!(out, "    @{:#x}  @selector({})", s.va, s.name);
+        }
+        if image.selrefs.len() > sel_cap {
+            let _ = writeln!(
+                out,
+                "    … {} more selref(s) omitted",
+                image.selrefs.len() - sel_cap
+            );
+        }
     }
     out
 }
@@ -553,18 +650,19 @@ mod tests {
     const DATA_VM: u64 = TEXT_VM + 0x400;
     const DATA_FILE: usize = 0x400;
 
-    // Content offsets inside the file / VAs.
-    const CLASSNAME_OFF: usize = 0x300;
-    const METHNAME_OFF: usize = 0x310;
-    const METHTYPE_OFF: usize = 0x330;
-    const METHLIST_OFF: usize = 0x350;
-    const CLASS_RO_OFF: usize = 0x3A0;
-    const META_RO_OFF: usize = 0x3D0;
+    // Content lives after the load-command blob (ends at 0x330) so section
+    // headers are not stomped by string / method-list bytes.
+    const CLASSNAME_OFF: usize = 0x340;
+    const METHNAME_OFF: usize = 0x350;
+    const METHTYPE_OFF: usize = 0x370;
+    const METHLIST_OFF: usize = 0x390;
+    const CLASS_RO_OFF: usize = 0x480; // in __DATA file range
+    const META_RO_OFF: usize = 0x4B0;
 
     const CLASSLIST_OFF: usize = DATA_FILE; // 0x400
     const CLASS_OFF: usize = DATA_FILE + 0x10; // 0x410
     const META_OFF: usize = DATA_FILE + 0x40; // 0x440
-    const SELREF_OFF: usize = DATA_FILE + 0x70; // 0x470 — for relative tests
+    const SELREF_OFF: usize = DATA_FILE + 0x70; // 0x470
 
     fn put(img: &mut [u8], off: usize, bytes: &[u8]) {
         img[off..off + bytes.len()].copy_from_slice(bytes);
@@ -665,7 +763,7 @@ mod tests {
             b"__objc_const",
             b"__TEXT",
             TEXT_VM + METHLIST_OFF as u64,
-            0xB0,
+            0x70,
             METHLIST_OFF as u32,
         );
 
@@ -780,8 +878,8 @@ mod tests {
 
         let class_va = DATA_VM + 0x10;
         let meta_va = DATA_VM + 0x40;
-        let class_ro_va = TEXT_VM + CLASS_RO_OFF as u64;
-        let meta_ro_va = TEXT_VM + META_RO_OFF as u64;
+        let class_ro_va = DATA_VM + (CLASS_RO_OFF - DATA_FILE) as u64;
+        let meta_ro_va = DATA_VM + (META_RO_OFF - DATA_FILE) as u64;
 
         // classlist
         put64(&mut img, CLASSLIST_OFF, class_va);
@@ -796,6 +894,9 @@ mod tests {
         put64(&mut img, META_OFF, meta_va); // isa → self
         put64(&mut img, META_OFF + 8, 0);
         put64(&mut img, META_OFF + 0x20, meta_ro_va);
+
+        // __objc_selrefs: one slot pointing at "doThing".
+        put64(&mut img, SELREF_OFF, sel_dothing);
 
         img
     }
@@ -841,6 +942,8 @@ mod tests {
         // Rename the classlist section so it is not found.
         let d = 0x20 + 472;
         put(&mut img, d + 72, b"__not_classlist\0");
+        // Also hide selrefs so the image is truly empty of ObjC facts.
+        put(&mut img, d + 72 + 160, b"__not_selrefs\0\0");
         let mach = MachFile::parse(&img).unwrap();
         let objc = recover(&mach, &img).unwrap();
         assert!(objc.is_empty());
@@ -859,6 +962,17 @@ mod tests {
         assert!(text.contains("-[Demo doThing]"), "{text}");
         assert!(text.contains("-[Demo count]"), "{text}");
         assert!(text.contains("@end"), "{text}");
+        assert!(text.contains("@selector(doThing)"), "{text}");
+    }
+
+    #[test]
+    fn recovers_selrefs() {
+        let img = synthetic_objc_macho(false);
+        let mach = MachFile::parse(&img).unwrap();
+        let objc = recover(&mach, &img).unwrap();
+        assert_eq!(objc.selrefs.len(), 1);
+        assert_eq!(objc.selrefs[0].name, "doThing");
+        assert_eq!(objc.selrefs[0].va, DATA_VM + 0x70);
     }
 
     #[test]
@@ -866,8 +980,10 @@ mod tests {
         let img = synthetic_objc_macho(false);
         let mach = MachFile::parse(&img).unwrap();
         let objc = recover_capped(&mach, &img, 0).unwrap();
-        assert!(objc.is_empty());
+        assert!(objc.classes.is_empty());
         assert!(objc.classes_capped);
+        // Selrefs still recover with a zero class cap.
+        assert!(!objc.selrefs.is_empty());
     }
 
     #[test]

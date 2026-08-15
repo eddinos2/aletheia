@@ -28,6 +28,10 @@ pub const MAX_RETURNS: usize = 8;
 /// [`callers_of`].
 pub const MAX_RETURN_CALLERS: usize = 64;
 
+/// Skip [`try_confirm_returns`] when the program call graph has more than
+/// this many edges — keeps decompile/MCP cheap on huge images.
+pub const MAX_CONFIRM_CG_EDGES: usize = 32_768;
+
 /// How a signature fact was obtained. Ranked like [`crate::funcs::Source`]:
 /// symbol-derived (slice 14) > dataflow-proven > ABI-assumed > heuristic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -637,7 +641,8 @@ fn expr_uses_names(e: &Expr, names: &BTreeSet<u16>) -> bool {
 ///
 /// Call-graph wiring stays out of [`recover`]: `redump` (or another
 /// driver) gathers caller SSAs via [`callers_of`] + lift and passes them
-/// here.
+/// here — or call [`try_confirm_returns`] when a [`crate::cfg::Program`]
+/// is already in hand.
 pub fn confirm_returns(sig: &mut Signature, callers: &[&SsaFunction]) {
     let mut confirmed = false;
     for caller in callers.iter().take(MAX_RETURN_CALLERS) {
@@ -654,6 +659,53 @@ pub fn confirm_returns(sig: &mut Signature, callers: &[&SsaFunction]) {
             r.provenance = Provenance::DataflowProven;
         }
     }
+}
+
+/// When `program.call_graph` is small enough ([`MAX_CONFIRM_CG_EDGES`]),
+/// lift at most [`MAX_RETURN_CALLERS`] callers of `sig.entry` and run
+/// [`confirm_returns`]. Total: skips on lift/SSA failure; never panics.
+pub fn try_confirm_returns(
+    sig: &mut Signature,
+    program: &crate::cfg::Program,
+    image: &dyn crate::model::Image,
+) {
+    let edges: usize = program.call_graph.values().map(|s| s.len()).sum();
+    if edges > MAX_CONFIRM_CG_EDGES {
+        return;
+    }
+    let caller_vas = callers_of(&program.call_graph, sig.entry);
+    if caller_vas.is_empty() {
+        return;
+    }
+    let mut lifted: Vec<SsaFunction> = Vec::new();
+    for va in caller_vas {
+        let Some(func) = program.functions.get(&va) else {
+            continue;
+        };
+        let Some(raw) = crate::irlift::lift_function(image, func) else {
+            continue;
+        };
+        let lifted_fn = match crate::callfx::abi_for(image.arch()) {
+            Some(abi) => crate::callfx::apply(&raw, &abi),
+            None => raw,
+        };
+        let Ok(ssa) = crate::irssa::construct(&lifted_fn) else {
+            continue;
+        };
+        let (opt, _) = crate::irssaopt::optimize(&ssa);
+        let (fwd, _) = crate::irssaopt::forward(&opt);
+        let live_out = crate::callfx::function_live_out(image.arch()).unwrap_or_default();
+        let (swept, _) = crate::irssaopt::eliminate_dead(&fwd, &live_out);
+        lifted.push(swept);
+        if lifted.len() >= MAX_RETURN_CALLERS {
+            break;
+        }
+    }
+    if lifted.is_empty() {
+        return;
+    }
+    let refs: Vec<&SsaFunction> = lifted.iter().collect();
+    confirm_returns(sig, &refs);
 }
 
 /// From-scratch sanity check. Total.

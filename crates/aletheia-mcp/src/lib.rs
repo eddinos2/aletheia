@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use aletheia::annotate;
 use aletheia::patch::{self, fnv1a64};
 use aletheia::{
-    anchor, callfx, cfg, diff, funcs, irlift, irout, irssa, irssaopt, irstruct, irstack, jumptable,
-    listing, mempromote, pseudo, sig, xref,
+    anchor, callfx, cfg, diff, funcs, irlift, irout, irssa, irssaopt, irstruct, irstack, irtype,
+    jumptable, listing, mempromote, pseudo, sig, xref,
 };
 
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -292,12 +292,17 @@ fn decompile(state: &Arc<Mutex<State>>, id: u64, line: &str) -> String {
         let stack = irstack::analyze(&swept);
         let promote = mempromote::promote(&swept, &stack);
         let swept = mempromote::apply(&swept, &promote);
-        let signature = sig::recover(&swept);
+        let mut signature = sig::recover(&swept);
+        sig::try_confirm_returns(&mut signature, program, image.as_ref());
+        let type_facts = irtype::collect(&swept);
+        let mut type_table = aletheia::types::TypeTable::new();
+        let type_map =
+            irtype::attach_sig_with_evidence(&swept, &signature, &type_facts, &mut type_table);
         let (root, _) = irstruct::structure(&swept, &tables);
         let (vars, _) = irout::out_of_ssa(&swept);
         let names = mempromote::var_namer(&swept, &stack, &promote, &vars.var_of);
         let namer = |v: u32| names.get(&v).cloned();
-        let header = signature.render_header();
+        let header = type_map.render_proto(&signature, &type_table);
         let text = pseudo::render_with_proto(&swept, &root, &vars, &namer, Some(&header));
         let hash = sess.hash;
         let entry_va = func.entry;

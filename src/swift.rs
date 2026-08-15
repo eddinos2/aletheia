@@ -46,6 +46,9 @@ pub const MAX_CSTR_LEN: usize = 1024;
 /// Cap on `__swift5_*` sections inventoried (hostile section tables).
 pub const MAX_SECTIONS: usize = 256;
 
+/// Cap on protocol conformance descriptors from `__swift5_proto`.
+pub const MAX_PROTO_CONFORMANCES: usize = 65_536;
+
 /// Cap on parent-descriptor walks when resolving a module prefix.
 const MAX_PARENT_DEPTH: usize = 8;
 
@@ -187,6 +190,12 @@ pub struct SwiftImage {
     pub typerefs: Vec<String>,
     /// True when typeref recovery hit [`MAX_STRINGS`].
     pub typerefs_capped: bool,
+    /// Protocol conformance descriptor VAs from `__swift5_proto`.
+    pub proto_conformances: Vec<u64>,
+    /// True when proto recovery hit [`MAX_PROTO_CONFORMANCES`].
+    pub proto_capped: bool,
+    /// File VA of `__swift5_proto` when present.
+    pub proto_va: Option<u64>,
 }
 
 impl SwiftImage {
@@ -240,6 +249,13 @@ pub fn recover_capped(mach: &MachFile, data: &[u8], max_types: usize) -> SwiftRe
         let (strs, capped) = sample_typerefs(data, sect, MAX_STRINGS)?;
         image.typerefs = strs;
         image.typerefs_capped = capped;
+    }
+
+    if let Some(sect) = find_section(mach, "__swift5_proto") {
+        image.proto_va = Some(sect.addr);
+        let (vas, capped) = parse_rel32_list(mach, data, sect, MAX_PROTO_CONFORMANCES)?;
+        image.proto_conformances = vas;
+        image.proto_capped = capped;
     }
 
     Ok(image)
@@ -349,6 +365,29 @@ pub fn render(image: &SwiftImage, max_types: usize) -> String {
                 out,
                 "    … {} more typeref(s) omitted",
                 image.typerefs.len() - 32
+            );
+        }
+    }
+
+    if image.proto_va.is_some() || !image.proto_conformances.is_empty() {
+        let _ = writeln!(
+            out,
+            "  {} protocol conformance descriptor(s){}",
+            image.proto_conformances.len(),
+            if image.proto_capped {
+                " (capped)"
+            } else {
+                ""
+            }
+        );
+        for va in image.proto_conformances.iter().take(32) {
+            let _ = writeln!(out, "    proto @{va:#x}");
+        }
+        if image.proto_conformances.len() > 32 {
+            let _ = writeln!(
+                out,
+                "    … {} more proto(s) omitted",
+                image.proto_conformances.len() - 32
             );
         }
     }
@@ -507,6 +546,54 @@ fn parse_types_section(
         capped = true;
     }
     Ok((types, capped))
+}
+
+/// Walk a section of relative 32-bit pointers (same layout as
+/// `__swift5_types` / `__swift5_proto`), returning resolved VAs.
+fn parse_rel32_list(
+    mach: &MachFile,
+    data: &[u8],
+    sect: &Section64,
+    max: usize,
+) -> SwiftResult<(Vec<u64>, bool)> {
+    let bytes = section_bytes(data, sect)?;
+    let n = bytes.len() / 4;
+    if n > max.max(MAX_PROTO_CONFORMANCES) {
+        return Err(SwiftError::CapExceeded {
+            what: "relative pointer list",
+            value: n,
+            cap: max,
+        });
+    }
+    let mut out = Vec::new();
+    let mut capped = false;
+    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+        if out.len() >= max {
+            capped = true;
+            break;
+        }
+        let mut word = [0u8; 4];
+        word.copy_from_slice(chunk);
+        let rel = i32::from_le_bytes(word);
+        let Some(entry_va) = sect.addr.checked_add((i as u64).saturating_mul(4)) else {
+            break;
+        };
+        let Some(target) = relative_va(entry_va, rel) else {
+            continue;
+        };
+        if target == 0 || out.contains(&target) {
+            continue;
+        }
+        // Ensure the descriptor start is file-backed (soft skip).
+        if mach.vaddr_to_offset(target).is_err() {
+            continue;
+        }
+        out.push(target);
+    }
+    if !capped && n > max {
+        capped = true;
+    }
+    Ok((out, capped))
 }
 
 fn parse_type_descriptor(mach: &MachFile, data: &[u8], desc_va: u64) -> Option<SwiftType> {

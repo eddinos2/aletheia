@@ -102,6 +102,122 @@ pub fn aarch64_b(from_va: u64, to_va: u64) -> Option<[u8; 4]> {
     Some(word.to_le_bytes())
 }
 
+/// `RET` (return via X30/LR) — encoding `D65F03C0`.
+pub fn aarch64_ret() -> [u8; 4] {
+    [0xC0, 0x03, 0x5F, 0xD6]
+}
+
+/// `BR <Xn>` — branch to register (`D61F0000 | (rn << 5)`).
+pub fn aarch64_br(rn: u8) -> Option<[u8; 4]> {
+    if rn > 30 {
+        return None;
+    }
+    let word = 0xD61F_0000u32 | (u32::from(rn) << 5);
+    Some(word.to_le_bytes())
+}
+
+/// `MOVZ <Xd|Wd>, #imm16, LSL #shift` — public move-wide encoding.
+/// `shift` is the bit shift (0/16/32/48); `sf` selects 64-bit.
+pub fn aarch64_movz(sf: bool, rd: u8, imm16: u16, shift: u8) -> Option<[u8; 4]> {
+    if rd > 31 {
+        return None;
+    }
+    let hw = match shift {
+        0 => 0u32,
+        16 => 1,
+        32 if sf => 2,
+        48 if sf => 3,
+        _ => return None,
+    };
+    let word = 0x5280_0000u32
+        | (u32::from(sf) << 31)
+        | (hw << 21)
+        | (u32::from(imm16) << 5)
+        | u32::from(rd);
+    Some(word.to_le_bytes())
+}
+
+/// Named public encodings the patch assembler can emit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AsmOp {
+    /// Architecture-default NOP fill (A64 4-byte / x86 0x90).
+    Nop,
+    /// AArch64 `RET`.
+    Ret,
+    /// AArch64 `B` to absolute VA.
+    Branch { to: u64 },
+    /// AArch64 `BR Xn`.
+    Br { rn: u8 },
+    /// AArch64 `MOVZ` (64-bit when `sf`).
+    Movz {
+        sf: bool,
+        rd: u8,
+        imm16: u16,
+        shift: u8,
+    },
+}
+
+/// Assemble `op` at `va` into little-endian bytes matching `old.len()` when
+/// possible. Returns `None` when the encoding is unsupported or length
+/// cannot match (same-length PatchSet rule).
+pub fn assemble_bytes(arch: crate::model::Arch, va: u64, old_len: usize, op: &AsmOp) -> Option<Vec<u8>> {
+    use crate::model::Arch;
+    match (arch, op) {
+        (Arch::Aarch64, AsmOp::Nop) if old_len == 4 => Some(aarch64_nop().to_vec()),
+        (Arch::Aarch64, AsmOp::Ret) if old_len == 4 => Some(aarch64_ret().to_vec()),
+        (Arch::Aarch64, AsmOp::Branch { to }) if old_len == 4 => {
+            aarch64_b(va, *to).map(|b| b.to_vec())
+        }
+        (Arch::Aarch64, AsmOp::Br { rn }) if old_len == 4 => aarch64_br(*rn).map(|b| b.to_vec()),
+        (Arch::Aarch64, AsmOp::Movz { sf, rd, imm16, shift }) if old_len == 4 => {
+            aarch64_movz(*sf, *rd, *imm16, *shift).map(|b| b.to_vec())
+        }
+        (Arch::X86_64, AsmOp::Nop) if old_len > 0 => Some(vec![0x90; old_len]),
+        (Arch::X86_64, AsmOp::Ret) if old_len == 1 => Some(vec![0xC3]),
+        _ => None,
+    }
+}
+
+/// Build a same-length patch at `va` from a public [`AsmOp`].
+pub fn assemble_patch(
+    image: &dyn Image,
+    va: u64,
+    old: &[u8],
+    op: AsmOp,
+    intent: &str,
+) -> Result<PatchSet> {
+    let off = image
+        .va_to_offset(va)
+        .ok_or(ParseError::UnmappedVaddr(va))?;
+    let bytes = image.bytes();
+    if off + old.len() > bytes.len() || bytes[off..off + old.len()] != old[..] {
+        return Err(ParseError::Unsupported(format!(
+            "bytes at {va:#x} do not match precondition"
+        )));
+    }
+    let new = assemble_bytes(image.arch(), va, old.len(), &op).ok_or_else(|| {
+        ParseError::Unsupported(format!(
+            "cannot assemble {:?} at {va:#x} for {}-byte site",
+            op,
+            old.len()
+        ))
+    })?;
+    if new.len() != old.len() {
+        return Err(ParseError::Unsupported(
+            "assembled length mismatch".into(),
+        ));
+    }
+    Ok(PatchSet::new(
+        bytes,
+        vec![PatchEdit {
+            va,
+            old_bytes: old.to_vec(),
+            new_bytes: new,
+            intent: intent.into(),
+        }],
+    ))
+}
+
 impl PatchSet {
     pub fn new(target_bytes: &[u8], edits: Vec<PatchEdit>) -> PatchSet {
         PatchSet {
@@ -221,34 +337,7 @@ fn hex_bytes(b: &[u8]) -> String {
 
 /// Build a single-site NOP patch at `va` if the mapped bytes match `old`.
 pub fn nop_patch(image: &dyn Image, va: u64, old: &[u8], intent: &str) -> Result<PatchSet> {
-    let off = image
-        .va_to_offset(va)
-        .ok_or(ParseError::UnmappedVaddr(va))?;
-    let bytes = image.bytes();
-    if off + old.len() > bytes.len() || bytes[off..off + old.len()] != old[..] {
-        return Err(ParseError::Unsupported(format!(
-            "bytes at {va:#x} do not match precondition"
-        )));
-    }
-    let new = if old.len() == 4 {
-        aarch64_nop().to_vec()
-    } else {
-        vec![0x90; old.len()] // x86 NOP fill
-    };
-    if new.len() != old.len() {
-        return Err(ParseError::Unsupported(
-            "NOP fill length mismatch".into(),
-        ));
-    }
-    Ok(PatchSet::new(
-        bytes,
-        vec![PatchEdit {
-            va,
-            old_bytes: old.to_vec(),
-            new_bytes: new,
-            intent: intent.into(),
-        }],
-    ))
+    assemble_patch(image, va, old, AsmOp::Nop, intent)
 }
 
 /// Instruction-level hunk sketch for a Modified diff pair: byte windows
@@ -397,6 +486,38 @@ mod tests {
     #[test]
     fn a64_nop_encoding() {
         assert_eq!(aarch64_nop(), [0x1F, 0x20, 0x03, 0xD5]);
+    }
+
+    #[test]
+    fn a64_public_encodings_round_trip() {
+        assert_eq!(aarch64_ret(), [0xC0, 0x03, 0x5F, 0xD6]);
+        assert_eq!(aarch64_br(0).unwrap(), [0x00, 0x00, 0x1F, 0xD6]);
+        // MOVZ X0, #42
+        assert_eq!(
+            aarch64_movz(true, 0, 42, 0).unwrap(),
+            [0x40, 0x05, 0x80, 0xD2]
+        );
+        let b = aarch64_b(0x1000, 0x1010).unwrap();
+        assert_eq!(u32::from_le_bytes(b), 0x1400_0004);
+    }
+
+    #[test]
+    fn assemble_ret_patch() {
+        let mut bytes = vec![0u8; 8];
+        bytes[0..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let img = FakeImg {
+            bytes: bytes.clone(),
+            base: 0x1000,
+        };
+        let set = assemble_patch(
+            &img,
+            0x1000,
+            &bytes[0..4],
+            AsmOp::Ret,
+            "force ret",
+        )
+        .unwrap();
+        assert_eq!(set.edits[0].new_bytes, aarch64_ret());
     }
 
     #[test]

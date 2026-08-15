@@ -751,4 +751,13 @@ cbf43926\thello_crc
         assert_eq!(c.entry_count, MAX_CORPUS_ENTRIES);
         check_corpus(&c).unwrap();
     }
+
+    #[test]
+    fn sample_corpus_file_loads() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/flirt/sample.corpus");
+        let corpus = load_corpus(&path).expect("sample corpus");
+        assert!(!corpus.is_empty(), "sample corpus should have entries");
+        assert!(corpus.entry_count >= 4);
+        check_corpus(&corpus).unwrap();
+    }
 }

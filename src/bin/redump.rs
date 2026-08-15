@@ -662,7 +662,8 @@ fn print_sigs(
         let (fwd, _) = irssaopt::forward(&opt);
         let live_out = callfx::function_live_out(image.arch()).unwrap_or_default();
         let (swept, _) = irssaopt::eliminate_dead(&fwd, &live_out);
-        let facts = sig::recover(&swept);
+        let mut facts = sig::recover(&swept);
+        sig::try_confirm_returns(&mut facts, &program, image.as_ref());
         if let Err(e) = sig::check(&swept, &facts) {
             writeln!(out, "// check failed: {e}").map_err(io)?;
         }
@@ -971,7 +972,12 @@ fn print_decompile(
         let stack = irstack::analyze(&swept);
         let promote = mempromote::promote(&swept, &stack);
         let swept = mempromote::apply(&swept, &promote);
-        let signature = sig::recover(&swept);
+        let mut signature = sig::recover(&swept);
+        sig::try_confirm_returns(&mut signature, &program, image.as_ref());
+        let type_facts = irtype::collect(&swept);
+        let mut type_table = types::TypeTable::new();
+        let type_map =
+            irtype::attach_sig_with_evidence(&swept, &signature, &type_facts, &mut type_table);
         let (root, stats) = irstruct::structure(&swept, &tables);
         if stats.capped {
             writeln!(out, "// note: structuring capped, remainder is gotos").map_err(io)?;
@@ -979,7 +985,7 @@ fn print_decompile(
         let (vars, _) = irout::out_of_ssa(&swept);
         let names = mempromote::var_namer(&swept, &stack, &promote, &vars.var_of);
         let namer = |v: u32| names.get(&v).cloned();
-        let header = signature.render_header();
+        let header = type_map.render_proto(&signature, &type_table);
         out.write_all(
             pseudo::render_with_proto(&swept, &root, &vars, &namer, Some(&header)).as_bytes(),
         )
@@ -4954,7 +4960,10 @@ mod tests {
         let text = dump_to_string(&img, opts).unwrap();
         assert!(text.contains("PSEUDOCODE"), "{text}");
         assert!(
-            text.contains("(a)") || text.contains("(a, "),
+            text.contains("(a)")
+                || text.contains("(a, ")
+                || text.contains(" a)")
+                || text.contains(" a, "),
             "sig header should spell at least one param:\n{text}"
         );
         assert!(

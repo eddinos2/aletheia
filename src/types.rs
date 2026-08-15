@@ -141,18 +141,67 @@ impl ParamTypeMap {
         for &(ix, id) in &self.params {
             let tok = table
                 .get(id)
-                .map(|k| k.token())
+                .map(|k| display_token(k, table))
                 .unwrap_or_else(|| "?".into());
             let _ = writeln!(out, "  param[{ix}] t{} {tok}", id.0);
         }
         if let Some(id) = self.ret {
             let tok = table
                 .get(id)
-                .map(|k| k.token())
+                .map(|k| display_token(k, table))
                 .unwrap_or_else(|| "?".into());
             let _ = writeln!(out, "  return t{} {tok}", id.0);
         }
         out
+    }
+
+    /// C-ish prototype for `pseudo` headers using table tokens
+    /// (`u64 foo(i32 a, ptr b)`). Falls back to width-only ints.
+    pub fn render_proto(&self, sig: &Signature, table: &TypeTable) -> String {
+        let name = match sig.name.as_deref() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => format!("sub_{:x}", sig.entry),
+        };
+        let ret = self
+            .ret
+            .and_then(|id| table.get(id))
+            .map(|k| display_token(k, table))
+            .unwrap_or_else(|| "int".into());
+        let mut args = Vec::new();
+        for (i, p) in sig.params.iter().enumerate() {
+            let letter = if i < 26 {
+                ((b'a' + i as u8) as char).to_string()
+            } else {
+                format!("a{}", i - 26)
+            };
+            let tok = self
+                .params
+                .iter()
+                .find(|(ix, _)| *ix == i as u16)
+                .and_then(|(_, id)| table.get(*id))
+                .map(|k| display_token(k, table))
+                .unwrap_or_else(|| format!("int{}", p.width.bits()));
+            args.push(format!("{tok} {letter}"));
+        }
+        let arg_s = args.join(", ");
+        if sig.stack_bytes == 0 {
+            format!("{ret} {name}({arg_s})")
+        } else if arg_s.is_empty() {
+            format!("{ret} {name}(stack={})", sig.stack_bytes)
+        } else {
+            format!("{ret} {name}({arg_s}; stack={})", sig.stack_bytes)
+        }
+    }
+}
+
+/// Presentation token: collapse `ptr(tN)` with unknown pointee to `ptr`.
+pub fn display_token(kind: &TypeKind, table: &TypeTable) -> String {
+    match kind {
+        TypeKind::Ptr { pointee } => match table.get(*pointee) {
+            Some(TypeKind::Unknown) | None => "ptr".into(),
+            Some(inner) => format!("ptr<{}>", display_token(inner, table)),
+        },
+        other => other.token(),
     }
 }
 
@@ -301,5 +350,20 @@ mod tests {
         assert!(dump.contains("param[0]"), "{dump}");
         assert!(dump.contains("int64"), "{dump}");
         assert_eq!(map.entry, s.entry);
+        let proto = map.render_proto(&s, &table);
+        assert!(proto.starts_with("int64 add("), "{proto}");
+        assert!(proto.contains("int64 a"), "{proto}");
+        assert!(proto.contains("int64 b"), "{proto}");
+    }
+
+    #[test]
+    fn display_token_collapses_unknown_pointee() {
+        let mut t = TypeTable::new();
+        let u = t.intern_unknown();
+        let p = t.intern_ptr(u);
+        assert_eq!(display_token(t.get(p).unwrap(), &t), "ptr");
+        let i = t.intern_int(Width::W32, Some(false));
+        let p2 = t.intern_ptr(i);
+        assert_eq!(display_token(t.get(p2).unwrap(), &t), "ptr<u32>");
     }
 }

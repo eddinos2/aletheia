@@ -69,9 +69,10 @@
 //! Advanced SIMD vector ALU (two-reg-misc, shift-immediate, across-lanes,
 //! permutes, the BIC/ORN/BSL siblings), the structure
 //! loads/stores (`LD1`/`ST1`/...), LSE atomics (`LDADD`/`SWP`/`CAS`...),
-//! the D-key PAC data ops, `ERET`/`DRPS`, half precision, `PRFM`, the
-//! unprivileged `LDTR`/`STTR` forms, fixed-point converts (`FCVTZS` with
-//! a scale), and CRC32.
+//! the D-key PAC data ops, `ERET`/`DRPS`, half precision, the
+//! unprivileged `LDTR`/`STTR` forms, and fixed-point converts (`FCVTZS`
+//! with a scale). `PRFM` (unsigned-offset) and scalar `CRC32*` are
+//! modeled.
 
 use crate::error::{ParseError, Result};
 use std::fmt;
@@ -1128,6 +1129,25 @@ pub enum Opcode {
         rn: u8,
         mode: AddrMode,
     },
+    /// `PRFM <prfop>, [<Xn|SP>{, #imm}]`: prefetch hint (no architectural
+    /// register write). `rt` holds the 5-bit `prfop`; only the unsigned
+    /// immediate form is modeled here.
+    Prfm {
+        rt: u8,
+        rn: u8,
+        imm: i64,
+    },
+    /// `CRC32{C}{B,H,W,X} <Wd>, <Wn>, <Wm|Xm>`: IEEE CRC accumulate.
+    /// `c` selects the CRC32C polynomial; `sz` is log2(access bytes)
+    /// (0=B, 1=H, 2=W, 3=X with `sf` on the source).
+    Crc32 {
+        c: bool,
+        sz: u8,
+        sf: bool,
+        rd: u8,
+        rn: u8,
+        rm: u8,
+    },
     /// `NOP`.
     Nop,
     /// `YIELD` hint.
@@ -1803,6 +1823,14 @@ fn decode_load_store(w: u32, va: u64) -> Opcode {
         // `10` sign-extends to 64 bits (but is PRFM at doubleword), `11`
         // sign-extends to 32 bits (byte/halfword only). Everything else is
         // PRFM or an unallocated size/opc pair.
+        // PRFM unsigned-offset: size=11, opc=10.
+        if size == 3 && opc == 0b10 {
+            if bits(w, 25, 24) == 0b01 {
+                let imm = (bits(w, 21, 10) as i64) << 3;
+                return Opcode::Prfm { rt, rn, imm };
+            }
+            return Opcode::Unknown(w);
+        }
         match opc {
             0b00 | 0b01 => {}
             0b10 if size != 3 => {}
@@ -2733,7 +2761,71 @@ fn decode_dp_reg(w: u32) -> Opcode {
                 rn,
                 rm,
             },
-            // CRC32, subps, and the unallocated remainder.
+            // CRC32{C}{B,H,W,X}: opcode 0100xx / 0101xx (Arm ARM).
+            0b010000 => Opcode::Crc32 {
+                c: false,
+                sz: 0,
+                sf: false,
+                rd,
+                rn,
+                rm,
+            },
+            0b010001 => Opcode::Crc32 {
+                c: false,
+                sz: 1,
+                sf: false,
+                rd,
+                rn,
+                rm,
+            },
+            0b010010 => Opcode::Crc32 {
+                c: false,
+                sz: 2,
+                sf: false,
+                rd,
+                rn,
+                rm,
+            },
+            0b010011 if sf => Opcode::Crc32 {
+                c: false,
+                sz: 3,
+                sf: true,
+                rd,
+                rn,
+                rm,
+            },
+            0b010100 => Opcode::Crc32 {
+                c: true,
+                sz: 0,
+                sf: false,
+                rd,
+                rn,
+                rm,
+            },
+            0b010101 => Opcode::Crc32 {
+                c: true,
+                sz: 1,
+                sf: false,
+                rd,
+                rn,
+                rm,
+            },
+            0b010110 => Opcode::Crc32 {
+                c: true,
+                sz: 2,
+                sf: false,
+                rd,
+                rn,
+                rm,
+            },
+            0b010111 if sf => Opcode::Crc32 {
+                c: true,
+                sz: 3,
+                sf: true,
+                rd,
+                rn,
+                rm,
+            },
             _ => Opcode::Unknown(w),
         };
     }
@@ -3952,6 +4044,32 @@ impl fmt::Display for Instruction {
                 if key_b { 'b' } else { 'a' }
             ),
             Opcode::Udf { imm } => write!(f, "udf #{imm:#x}"),
+            Opcode::Prfm { rt, rn, imm } => {
+                write!(f, "prfm #{rt:#x}, {}", fmt_mem(rn, AddrMode::Offset(imm)))
+            }
+            Opcode::Crc32 {
+                c,
+                sz,
+                sf,
+                rd,
+                rn,
+                rm,
+            } => {
+                let poly = if c { "crc32c" } else { "crc32" };
+                let suf = match sz {
+                    0 => "b",
+                    1 => "h",
+                    2 => "w",
+                    _ => "x",
+                };
+                write!(
+                    f,
+                    "{poly}{suf} {}, {}, {}",
+                    gp(false, rd),
+                    gp(false, rn),
+                    gp(sf, rm)
+                )
+            }
             Opcode::Bits1 { op, sf, rd, rn } => {
                 write!(f, "{} {}, {}", op.as_str(), gp(sf, rd), gp(sf, rn))
             }
@@ -4498,9 +4616,19 @@ mod tests {
         );
         assert_eq!(i.to_string(), "ldrsb w0, [x1], #0x1");
 
-        // PRFM (size = 11, opc = 10) and the unallocated size = 10/opc = 11
-        // pair are not sign-extending loads.
-        assert_eq!(ins(0xF980_0000, VA).opcode, Opcode::Unknown(0xF980_0000));
+        // PRFM (size = 11, opc = 10) unsigned offset is modeled; the
+        // unallocated size = 10/opc = 11 pair stays unknown.
+        let i = ins(0xF980_0000, VA);
+        assert_eq!(
+            i.opcode,
+            Opcode::Prfm {
+                rt: 0,
+                rn: 0,
+                imm: 0
+            }
+        );
+        assert_eq!(i.flow, Flow::Sequential);
+        assert_eq!(i.to_string(), "prfm #0x0, [x0]");
         assert_eq!(ins(0xB9C0_0000, VA).opcode, Opcode::Unknown(0xB9C0_0000));
     }
 
@@ -5034,6 +5162,26 @@ mod tests {
         // S = 1 and the unallocated opcode 0 stay Unknown.
         assert_eq!(ins(0xBAC2_0820, VA).opcode, Opcode::Unknown(0xBAC2_0820));
         assert_eq!(ins(0x9AC2_0020, VA).opcode, Opcode::Unknown(0x9AC2_0020));
+
+        // CRC32B W0, W1, W2 — opcode 010000.
+        let i = ins(0x1AC2_4020, VA);
+        assert_eq!(
+            i.opcode,
+            Opcode::Crc32 {
+                c: false,
+                sz: 0,
+                sf: false,
+                rd: 0,
+                rn: 1,
+                rm: 2
+            }
+        );
+        assert_eq!(i.to_string(), "crc32b w0, w1, w2");
+        // CRC32CX W3, W4, X5
+        assert_eq!(
+            ins(0x9AC5_5C83, VA).to_string(),
+            "crc32cx w3, w4, x5"
+        );
     }
 
     #[test]
